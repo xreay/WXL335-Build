@@ -1,0 +1,637 @@
+name: WXL335 R5.1 Unicode commit fix
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/wxl64-r51-unicode.yml'
+permissions:
+  contents: read
+concurrency:
+  group: wxl64-build
+  cancel-in-progress: false
+jobs:
+  build:
+    if: github.event.repository.private == false && github.ref == 'refs/heads/main'
+    runs-on: windows-2022
+    timeout-minutes: 180
+    steps:
+      - name: Check private package password
+        shell: pwsh
+        env:
+          WXL_PACKAGE_PASSWORD: ${{ secrets.WXL_PACKAGE_PASSWORD }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:WXL_PACKAGE_PASSWORD) -or $env:WXL_PACKAGE_PASSWORD.Length -lt 16 -or $env:WXL_PACKAGE_PASSWORD.Contains([char]10) -or $env:WXL_PACKAGE_PASSWORD.Contains([char]13)) {
+            throw 'Set repository Actions secret WXL_PACKAGE_PASSWORD (at least 16 characters, one line) before starting this workflow.'
+          }
+      - name: Acquire upstream sources
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          $root = Join-Path $env:GITHUB_WORKSPACE 'upstream'
+          New-Item -ItemType Directory -Path $root | Out-Null
+          # All three sync commits advertise ABI 0.1.46.
+          $pins = [ordered]@{
+            client = '8b56c7755390dca97eb040318bd821175db209aa'
+            core   = 'f7d6cdaf4393e3b89b7ccb889b295aa871d45ca9'
+            sdk    = '2920b6e3143169a4244dde6e9d832cd7721f2489'
+          }
+          $lock = [ordered]@{}
+          foreach ($repo in $pins.Keys) {
+            $dest = Join-Path $root $repo
+            git init $dest
+            git -C $dest remote add origin "https://github.com/WarcraftXL-Labs/$repo.git"
+            git -C $dest fetch --depth 1 origin $pins[$repo]
+            git -C $dest checkout --detach FETCH_HEAD
+            git -C $dest submodule update --init --recursive
+            $lock[$repo] = (git -C $dest rev-parse HEAD).Trim()
+            if ($lock[$repo] -ne $pins[$repo]) { throw "Unexpected source SHA: $repo" }
+            if ((Get-Content (Join-Path $dest 'README.md') -Raw) -notmatch 'ABI-0\.1\.46') { throw "ABI badge mismatch: $repo" }
+          }
+          $lock | ConvertTo-Json | Set-Content "$env:GITHUB_WORKSPACE/sources.json"
+          Get-Content "$env:GITHUB_WORKSPACE/sources.json"
+      - name: Apply targeted D3D9 HLSL identifier fix
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $shader = Join-Path $env:GITHUB_WORKSPACE 'upstream/core/src/gx/d3d9/shaders/draw.hlsl'
+          $source = [IO.File]::ReadAllText($shader)
+          $pattern = [regex]'//[^\r\n]*|\bline\b'
+          $count = @($pattern.Matches($source) | Where-Object { $_.Value -ceq 'line' }).Count
+          if ($count -ne 10) { throw "Unexpected HLSL identifier count: $count" }
+          if ($source -cmatch '\blineData\b') { throw 'Replacement identifier already exists' }
+          $fixed = $pattern.Replace($source, { param($match) if ($match.Value -ceq 'line') { 'lineData' } else { $match.Value } })
+          if (@($pattern.Matches($fixed) | Where-Object { $_.Value -ceq 'line' }).Count -ne 0) { throw 'Unpatched HLSL reserved identifier' }
+          [IO.File]::WriteAllText($shader, $fixed, [Text.UTF8Encoding]::new($false))
+          git -C upstream/core diff --check
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          git -C upstream/core diff --stat
+          "HLSL: 10 identifier references renamed, comments and arithmetic preserved." | Set-Content "$env:GITHUB_WORKSPACE/compatibility.txt"
+          "Compiler: VS2022 x64; constexpr steps 16777216." | Add-Content "$env:GITHUB_WORKSPACE/compatibility.txt"
+      - name: Apply MSVC x64 animation intrinsics fix
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $file = Join-Path $env:GITHUB_WORKSPACE 'upstream/core/src/tuning/Animate.cpp'
+          $source = [IO.File]::ReadAllText($file)
+          $eol = if ($source.Contains([string][char]13)) { [string][char]13 + [char]10 } else { [string][char]10 }
+          $pairs = @(
+            @{old='#include <intrin.h>'; new=('#include <intrin.h>' + $eol + '#include <immintrin.h>'); count=1},
+            @{old='uint32_t mxcsr = 0;' + $eol + '        __asm__ volatile("stmxcsr %0" : "=m"(mxcsr));'; new='const uint32_t mxcsr = _mm_getcsr();'; count=1},
+            @{old='__asm__ volatile("ldmxcsr %0" : : "m"(mxcsr));'; new='_mm_setcsr(mxcsr);'; count=1},
+            @{old='__asm__ volatile("pause");'; new='_mm_pause();'; count=2}
+          )
+          foreach ($pair in $pairs) {
+            $count = [regex]::Matches($source, [regex]::Escape($pair.old)).Count
+            if ($count -ne $pair.count) { throw "Unexpected Animate.cpp match count: $count for $($pair.old)" }
+            $source = $source.Replace($pair.old, $pair.new)
+          }
+          if ([regex]::Matches($source, '\b__asm__\b').Count -ne 2) { throw 'Unexpected remaining assembly; only x86 x87 paths should remain' }
+          [IO.File]::WriteAllText($file, $source, [Text.UTF8Encoding]::new($false))
+          git -C upstream/core diff --check
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          git -C upstream/core diff --stat
+          'Animate.cpp: MXCSR save/restore and PAUSE use equivalent CPU intrinsics. x86-only x87 code unchanged.' | Add-Content "$env:GITHUB_WORKSPACE/compatibility.txt"
+      - name: Apply R5 native Unicode input changes
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          @'
+          from pathlib import Path
+          import re
+          root = Path("upstream/client")
+          def patch(path, transform):
+              p = root / path
+              s = p.read_text(encoding="utf-8")
+              out = transform(s)
+              assert out != s, path
+              p.write_bytes(out.encode("utf-8"))
+              print("Unicode patch:", path)
+          def rep(s, a, b, expected=1):
+              assert s.count(a) == expected, (a, s.count(a), expected)
+              return s.replace(a,b)
+          def func(s, sig, body):
+              p = re.compile(r"^" + re.escape(sig) + r" \{.*?^\}", re.M | re.S)
+              out, n = p.subn(lambda m: sig + " {\n" + body.strip("\n") + "\n}", s)
+              assert n == 1, (sig,n)
+              return out
+          
+          # Native Unicode HWNDs on all three supported graphics paths.
+          def window(s, name):
+              s = rep(s, "WNDCLASSEXA windowClass;", "WNDCLASSEXW windowClass;")
+              s = rep(s, 'windowClass.lpszClassName = "' + name + '";', 'windowClass.lpszClassName = L"' + name + '";')
+              s = rep(s, "RegisterClassExA(&windowClass)", "RegisterClassExW(&windowClass)")
+              s = rep(s, 'CreateWindowExA(WS_EX_APPWINDOW, "'+name+'", CLIENT_NAME,', 'CreateWindowExW(WS_EX_APPWINDOW, L"'+name+'", L"" CLIENT_NAME,')
+              s = rep(s, "reinterpret_cast<CREATESTRUCTA*>(lparam)", "reinterpret_cast<CREATESTRUCTW*>(lparam)")
+              s = rep(s, "DefWindowProcA(hwnd, message, wparam, lparam)", "DefWindowProcW(hwnd, message, wparam, lparam)", 2)
+              s = rep(s, "UnregisterClassA(reinterpret_cast<const char*>", "UnregisterClassW(reinterpret_cast<const wchar_t*>")
+              return s
+          for path,name in [
+              ("Engine/Source/Gx/CGxDeviceD3d/CGxDeviceD3d.cpp","GxWindowClassD3d"),
+              ("Engine/Source/Gx/CGxDeviceD3d9Ex/CGxDeviceD3d9Ex.cpp","GxWindowClassD3d9Ex"),
+              ("Engine/Source/Gx/CGxDeviceVk/CGxDeviceVk.cpp","GxWindowClassVk")]:
+              patch(path, lambda s: window(s,name))
+          
+          def input_patch(s):
+              s = rep(s,"PeekMessageA(&msg, nullptr, 0, 0, PM_NOREMOVE)","PeekMessageW(&msg, nullptr, 0, 0, PM_NOREMOVE)",2)
+              s = rep(s,"GetMessageA(&msg, nullptr, 0, 0)","GetMessageW(&msg, nullptr, 0, 0)")
+              s = rep(s,"DispatchMessageA(&msg)","DispatchMessageW(&msg)")
+              s = rep(s,"result = DefWindowProcA(hwnd, message, wparam, lparam);","result = IsWindowUnicode(hwnd) ? DefWindowProcW(hwnd, message, wparam, lparam) : DefWindowProcA(hwnd, message, wparam, lparam);")
+              s = rep(s,"static uint32_t s_codePage;","static uint32_t s_codePage;\nstatic uint32_t s_pendingHighSurrogate;")
+              s = rep(s,"case WM_ACTIVATE: {\n            BOOL minimized", "case WM_ACTIVATE: {\n            if (LOWORD(wparam) == WA_INACTIVE) s_pendingHighSurrogate = 0;\n            BOOL minimized")
+              s = rep(s,"        case WM_CHAR: {", r"""        case WM_UNICHAR:
+                      if (wparam == UNICODE_NOCHAR) return TRUE;
+                      s_pendingHighSurrogate = 0;
+                      if (wparam >= 0x20 && wparam <= 0x10FFFF &&
+                          !(wparam >= 0xD800 && wparam <= 0xDFFF)) {
+                          OsQueuePut(OS_INPUT_CHAR, static_cast<uint32_t>(wparam), 1, 0, 0);
+                      }
+                      return 0;
+          
+                  case WM_CHAR: {
+                      if (IsWindowUnicode(hwnd)) {
+                          uint32_t ch = static_cast<uint32_t>(wparam);
+                          if (ch >= 0xD800 && ch <= 0xDBFF) {
+                              s_pendingHighSurrogate = ch;
+                              return 0;
+                          }
+                          if (ch >= 0xDC00 && ch <= 0xDFFF) {
+                              if (!s_pendingHighSurrogate) return 0;
+                              ch = 0x10000 + ((s_pendingHighSurrogate - 0xD800) << 10) + (ch - 0xDC00);
+                          }
+                          s_pendingHighSurrogate = 0;
+                          if (ch >= 0x20 && ch <= 0x10FFFF) {
+                              OsQueuePut(OS_INPUT_CHAR, ch, LOWORD(lparam), 0, 0);
+                              return 0;
+                          }
+                          break;
+                      }
+          """)
+              return s
+          patch("Engine/Source/Os/Win64/Input.cpp", input_patch)
+          
+          def ime_patch(s):
+              s = rep(s,"#include <cstring>","#include <cstring>\n#include <vector>\n#include <cstddef>")
+              s = rep(s,"mode = reinterpret_cast<uintptr_t>(layout) == 0x08040804 ? OS_IME_MODE_ROMAN : OS_IME_MODE_CHINESE;","mode = OS_IME_MODE_CHINESE;")
+              s = rep(s,"static int32_t GetCompositionString(DWORD index, char* buffer, uint32_t bufferSize) {",r"""// Convert a bounded UTF-16 span without emitting partial UTF-8 characters.
+          static bool WxlUtf8(const wchar_t* text, int count, char* out, uint32_t capacity) {
+              if (!out || !capacity) return false;
+              out[0] = 0;
+              if (!count) return true;
+              if (count < 0 || capacity > 0x7fffffff) return false;
+              int limit = count < static_cast<int>(capacity - 1) ? count : static_cast<int>(capacity - 1);
+              while (limit > 0) {
+                  if (text[limit - 1] >= 0xD800 && text[limit - 1] <= 0xDBFF) { --limit; continue; }
+                  int bytes = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, text, limit, nullptr, 0, nullptr, nullptr);
+                  if (bytes > 0 && bytes < static_cast<int>(capacity)) {
+                      int written = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, text, limit, out, capacity - 1, nullptr, nullptr);
+                      if (written != bytes) { out[0] = 0; return false; }
+                      out[written] = 0;
+                      return true;
+                  }
+                  --limit;
+              }
+              return false;
+          }
+          static bool WxlReadComposition(HIMC context, DWORD kind, std::vector<wchar_t>& text) {
+              LONG bytes = ImmGetCompositionStringW(context, kind, nullptr, 0);
+              if (bytes < 0 || bytes > 65536 || bytes % sizeof(wchar_t)) return false;
+              text.resize(static_cast<size_t>(bytes) / sizeof(wchar_t));
+              if (!bytes) return true;
+              return ImmGetCompositionStringW(context, kind, text.data(), bytes) == bytes;
+          }
+          static uint32_t WxlCodePoints(const std::vector<wchar_t>& text, uint32_t end) {
+              uint32_t count = 0;
+              if (end > text.size()) end = static_cast<uint32_t>(text.size());
+              for (uint32_t i = 0; i < end; ++i) {
+                  if (text[i] >= 0xD800 && text[i] <= 0xDBFF && i + 1 < end &&
+                      text[i+1] >= 0xDC00 && text[i+1] <= 0xDFFF) ++i;
+                  ++count;
+              }
+              return count;
+          }
+          
+          static int32_t GetCompositionString(DWORD index, char* buffer, uint32_t bufferSize) {""")
+              s = func(s,"static int32_t GetCompositionString(DWORD index, char* buffer, uint32_t bufferSize)",r"""
+              if (!buffer || !bufferSize) return 0;
+              buffer[0] = 0;
+              HWND window = static_cast<HWND>(OsGuiGetWindow(OSGUI_WINDOW_TYPE_GX));
+              HIMC context = ImmGetContext(window);
+              if (!context) return 0;
+              std::vector<wchar_t> text;
+              bool ok = WxlReadComposition(context, index, text);
+              ImmReleaseContext(window, context);
+              return ok && WxlUtf8(text.data(), static_cast<int>(text.size()), buffer, bufferSize);
+          """)
+              s = func(s,"int32_t OsIMEGetClauseInfo(uint32_t& clauseStart, uint32_t& clauseEnd, uint32_t& cursor)",r"""
+              HWND window = static_cast<HWND>(OsGuiGetWindow(OSGUI_WINDOW_TYPE_GX));
+              HIMC context = ImmGetContext(window);
+              if (!context) return 0;
+              std::vector<wchar_t> text;
+              bool ok = WxlReadComposition(context, GCS_COMPSTR, text);
+              LONG cursorPos = ImmGetCompositionStringW(context, GCS_CURSORPOS, nullptr, 0);
+              LONG bytes = ImmGetCompositionStringW(context, GCS_COMPCLAUSE, nullptr, 0);
+              std::vector<DWORD> clauses;
+              if (ok && bytes >= 8 && bytes <= 65536 && bytes % sizeof(DWORD) == 0) {
+                  clauses.resize(bytes / sizeof(DWORD));
+                  ok = ImmGetCompositionStringW(context, GCS_COMPCLAUSE, clauses.data(), bytes) == bytes;
+              } else { ok = false; }
+              ImmReleaseContext(window, context);
+              if (!ok || cursorPos < 0 || static_cast<size_t>(cursorPos) > text.size() ||
+                  clauses.front() != 0 || clauses.back() != text.size()) return 0;
+              for (size_t i = 1; i < clauses.size(); ++i) {
+                  if (clauses[i] < clauses[i-1] || clauses[i] > text.size()) return 0;
+              }
+              size_t chosen = clauses.size() - 2;
+              for (size_t i = 0; i + 1 < clauses.size(); ++i) {
+                  if (static_cast<DWORD>(cursorPos) < clauses[i+1]) { chosen = i; break; }
+              }
+              clauseStart = WxlCodePoints(text, clauses[chosen]);
+              clauseEnd = WxlCodePoints(text, clauses[chosen+1]);
+              cursor = WxlCodePoints(text, static_cast<uint32_t>(cursorPos));
+              return 1;
+          """)
+              s = func(s,"int32_t OsIMEGetCandidates(uint32_t listMask, uint32_t& pageStart, uint32_t& pageSize, uint32_t& count, uint32_t& selection, TSGrowableArray<OsIMECandidate>& candidates)",r"""
+              candidates.Clear();
+              HWND window = static_cast<HWND>(OsGuiGetWindow(OSGUI_WINDOW_TYPE_GX));
+              HIMC context = ImmGetContext(window);
+              if (!context) return 0;
+              if (!listMask) { ImmReleaseContext(window, context); return 0; }
+              DWORD index = 0;
+              while (!(listMask & 1)) { listMask >>= 1; ++index; }
+              DWORD bytes = ImmGetCandidateListW(context, index, nullptr, 0);
+              if (bytes < sizeof(CANDIDATELIST) || bytes > 1048576) {
+                  ImmReleaseContext(window, context); return 0;
+              }
+              std::vector<DWORD> storage((bytes + 3) / 4);
+              DWORD actual = ImmGetCandidateListW(context, index, reinterpret_cast<CANDIDATELIST*>(storage.data()), bytes);
+              ImmReleaseContext(window, context);
+              if (actual < sizeof(CANDIDATELIST) || actual > bytes) return 0;
+              const auto* list = reinterpret_cast<const CANDIDATELIST*>(storage.data());
+              const size_t header = offsetof(CANDIDATELIST, dwOffset);
+              if (list->dwSize > actual || list->dwSize < header ||
+                  list->dwCount > (list->dwSize - header) / sizeof(DWORD) ||
+                  !list->dwCount || list->dwSelection >= list->dwCount || list->dwPageStart >= list->dwCount) return 0;
+              pageStart = list->dwPageStart;
+              pageSize = list->dwPageSize ? list->dwPageSize : 9;
+              if (pageSize > 32) pageSize = 32;
+              count = list->dwCount;
+              selection = list->dwSelection;
+              for (uint32_t i = 0; i < pageSize; ++i) {
+                  auto* candidate = candidates.New();
+                  candidate->m_text[0] = 0;
+                  uint32_t idx = pageStart + i;
+                  if (idx >= count) continue;
+                  DWORD offset = list->dwOffset[idx];
+                  if (offset < header + count * sizeof(DWORD) || offset >= list->dwSize || offset % sizeof(wchar_t)) continue;
+                  const wchar_t* text = reinterpret_cast<const wchar_t*>(reinterpret_cast<const char*>(list) + offset);
+                  size_t max = (list->dwSize - offset) / sizeof(wchar_t);
+                  size_t len = 0;
+                  while (len < max && text[len]) ++len;
+                  if (len < max) WxlUtf8(text, static_cast<int>(len), candidate->m_text, sizeof(candidate->m_text));
+              }
+              return 1;
+          """)
+              return s
+          patch("Engine/Source/Os/Win64/OsIME.cpp", ime_patch)
+          
+          def clipboard(s):
+              s = func(s,"char* IOsClipboardGetString(void* window)",r"""
+              if (!OpenClipboard(static_cast<HWND>(window))) return nullptr;
+              HANDLE data = GetClipboardData(CF_UNICODETEXT);
+              if (!data) { CloseClipboard(); return nullptr; }
+              const wchar_t* text = static_cast<const wchar_t*>(GlobalLock(data));
+              if (!text) { CloseClipboard(); return nullptr; }
+              size_t max = GlobalSize(data) / sizeof(wchar_t);
+              if (max > 1048576) max = 1048576;
+              size_t length = 0;
+              while (length < max && text[length]) ++length;
+              char* result = nullptr;
+              if (length < max) {
+                  int bytes = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, text,
+                      static_cast<int>(length + 1), nullptr, 0, nullptr, nullptr);
+                  if (bytes > 0) {
+                      result = static_cast<char*>(SMemAlloc(bytes, __FILE__, __LINE__, 0));
+                      if (result && WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, text,
+                          static_cast<int>(length + 1), result, bytes, nullptr, nullptr) != bytes) {
+                          SMemFree(result, __FILE__, __LINE__, 0); result = nullptr;
+                      }
+                  }
+              }
+              GlobalUnlock(data);
+              CloseClipboard();
+              return result;
+          """)
+              s = func(s,"int32_t IOsClipboardPutString(const char* string, void* window)",r"""
+              if (!string) return 0;
+              int length = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, string, -1, nullptr, 0);
+              if (length <= 0 || length > 1048576) return 0;
+              HGLOBAL mem = GlobalAlloc(GMEM_MOVEABLE, static_cast<size_t>(length) * sizeof(wchar_t));
+              if (!mem) return 0;
+              wchar_t* text = static_cast<wchar_t*>(GlobalLock(mem));
+              if (!text) { GlobalFree(mem); return 0; }
+              int written = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, string, -1, text, length);
+              GlobalUnlock(mem);
+              if (written != length || !OpenClipboard(static_cast<HWND>(window))) {
+                  GlobalFree(mem); return 0;
+              }
+              bool ok = EmptyClipboard() && SetClipboardData(CF_UNICODETEXT, mem);
+              CloseClipboard();
+              if (!ok) GlobalFree(mem);
+              return ok ? 1 : 0;
+          """)
+              return s
+          patch("Engine/Source/Os/Win64/OsClipboard.cpp",clipboard)
+          print("R5 Unicode source patch applied")
+          '@ | python -
+          if ($LASTEXITCODE -ne 0) { throw 'R5 source patch failed' }
+          git -C upstream/client diff --check
+          if ($LASTEXITCODE -ne 0) { throw 'R5 diff check failed' }
+          git -C upstream/client diff --stat
+          'R5: Unicode windows, UTF-16 IME, WM_UNICHAR, UTF-8 clipboard; device validation required.' | Add-Content "$env:GITHUB_WORKSPACE/compatibility.txt"
+      - name: Apply R5.1 per-message IME snapshot fix
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          @'
+          from pathlib import Path
+          root = Path("upstream/client")
+          def patch(path, replacements):
+              p = root / path
+              s = p.read_text(encoding="utf-8")
+              for a,b,n in replacements:
+                  assert s.count(a)==n, (path,a[:100],s.count(a),n)
+                  s=s.replace(a,b)
+              p.write_bytes(s.encode("utf-8"))
+              print("R5.1 patch:",path)
+          
+          patch("Engine/Source/Os/OsIME.h", [
+          ("#endif", """#if defined(WOWDECOMP_ARCH_64)
+          // Immutable per-message IME data; the event carries a token, not a pointer.
+          struct WxlImeSnapshot {
+              bool resultValid;
+              bool compositionValid;
+              bool clauseValid;
+              uint32_t clauseStart, clauseEnd, cursor;
+              char result[512];
+              char composition[512];
+          };
+          int32_t OsIMECaptureComposition(int32_t flags);
+          bool OsIMEReadSnapshot(int32_t token, WxlImeSnapshot& out);
+          #endif
+          
+          #endif""",1)])
+          patch("Engine/Source/Os/Win64/OsIME.cpp", [
+          ("#include <vector>","#include <vector>\n#include <array>\n#include <mutex>",1),
+          ("int32_t OsIMEGetClauseInfo(uint32_t& clauseStart, uint32_t& clauseEnd, uint32_t& cursor) {", """// Capture while the Win32 message is current rather than re-read a mutable HIMC later.
+          namespace {
+          struct WxlImeSlot { int32_t token = 0; WxlImeSnapshot data{}; };
+          static std::array<WxlImeSlot, 1024> s_imeSnapshots{};
+          static std::mutex s_imeSnapshotLock;
+          static uint32_t s_imeSequence = 0;
+          }
+          
+          int32_t OsIMECaptureComposition(int32_t flags) {
+              WxlImeSnapshot data{};
+              if (flags & 4) data.resultValid = OsIMEGetCompositionResult(data.result, sizeof(data.result)) != 0;
+              if (flags & 2) data.compositionValid = OsIMEGetCompositionString(data.composition, sizeof(data.composition)) != 0;
+              if (flags & 1) data.clauseValid = OsIMEGetClauseInfo(data.clauseStart, data.clauseEnd, data.cursor) != 0;
+              std::lock_guard<std::mutex> guard(s_imeSnapshotLock);
+              s_imeSequence = (s_imeSequence % 0x7fffffffU) + 1U;
+              auto& slot = s_imeSnapshots[s_imeSequence % s_imeSnapshots.size()];
+              slot.token = static_cast<int32_t>(s_imeSequence);
+              slot.data = data;
+              return slot.token;
+          }
+          
+          bool OsIMEReadSnapshot(int32_t token, WxlImeSnapshot& out) {
+              if (token <= 0) return false;
+              std::lock_guard<std::mutex> guard(s_imeSnapshotLock);
+              auto& slot = s_imeSnapshots[static_cast<uint32_t>(token) % s_imeSnapshots.size()];
+              if (slot.token != token) return false;
+              out = slot.data;
+              slot = WxlImeSlot{};
+              return true;
+          }
+          
+          int32_t OsIMEGetClauseInfo(uint32_t& clauseStart, uint32_t& clauseEnd, uint32_t& cursor) {""",1)])
+          patch("Engine/Source/Os/Win64/Input.cpp", [
+          ('#include "Engine/Source/Os/Input.h"','#include "Engine/Source/Os/Input.h"\n#include "Engine/Source/Os/OsIME.h"',1),
+          ("static OSEVENT s_queue[16];","static constexpr int32_t WXL_INPUT_QUEUE_CAPACITY = 256;\nstatic OSEVENT s_queue[WXL_INPUT_QUEUE_CAPACITY];",1),
+          ("s_queueTail == 15 ? 0 : s_queueTail + 1","s_queueTail == WXL_INPUT_QUEUE_CAPACITY - 1 ? 0 : s_queueTail + 1",1),
+          ("s_queueHead == 15 ? 0 : s_queueHead + 1","s_queueHead == WXL_INPUT_QUEUE_CAPACITY - 1 ? 0 : s_queueHead + 1",2),
+          ("OsQueuePut(OS_INPUT_IME, OS_INPUT_IME_COMPOSITION, 0, flags, 0);", """if (flags) {
+                          const int32_t token = OsIMECaptureComposition(flags);
+                          OsQueuePut(OS_INPUT_IME, OS_INPUT_IME_COMPOSITION, token, flags, 0);
+                      }""",1)])
+          patch("Engine/Source/Frame/CSimpleEditBox.cpp", [
+          ("""        case OS_INPUT_IME_COMPOSITION: {
+                      char buffer[512];""", """        case OS_INPUT_IME_COMPOSITION: {
+          #if defined(WOWDECOMP_ARCH_64)
+                      WxlImeSnapshot snapshot{};
+                      if (!OsIMEReadSnapshot(evt.m_data.unused_0004, snapshot)) {
+                          // Never read a newer composition in place of a lost snapshot.
+                          return 1;
+                      }
+                      if ((evt.m_data.m_param & 0x4) && snapshot.resultValid) {
+                          int32_t chars = 0;
+                          for (const char* c = snapshot.result; *c;) {
+                              uint32_t ch = sgetu8(reinterpret_cast<const uint8_t*>(c), &chars);
+                              if (chars <= 0 || ch > 0x10FFFF || ch == 0xFFFFFFFF) break;
+                              this->Insert(ch);
+                              c += chars;
+                          }
+                      }
+                      if ((evt.m_data.m_param & 0x2) && snapshot.compositionValid) {
+                          this->Insert(snapshot.composition, nullptr, 0, 1, 0);
+                          this->RunOnCharCompositionScript(snapshot.composition);
+                      }
+                      if (evt.m_data.m_param & 0x1) {
+                          if (!snapshot.clauseValid) {
+                              this->m_clauseEnd = this->m_cursorPos;
+                              this->m_clauseStart = this->m_cursorPos;
+                          } else {
+                              this->CreateClauseHighlight();
+                              int32_t left = this->m_highlightLeft;
+                              this->m_clauseStart = left + this->GetNumToLen(left, snapshot.clauseStart, false);
+                              this->m_clauseEnd = left + this->GetNumToLen(left, snapshot.clauseEnd, false);
+                              this->m_cursorPos = left + this->GetNumToLen(left, snapshot.cursor, false);
+                              this->m_dirtyBits |= 0x6;
+                          }
+                      }
+          #else
+                      char buffer[512];""",1),
+          ("""            if (evt.m_data.m_param & 0x1) {
+                          this->UpdateClauseInfo();
+                      }
+          
+                      return 1;""", """            if (evt.m_data.m_param & 0x1) {
+                          this->UpdateClauseInfo();
+                      }
+          #endif
+          
+                      return 1;""",1)])
+          # The existing input event dispatcher already transports param[1] in this spare field.
+          evt=(root/"Engine/Source/Event/EvtInput.cpp").read_text(encoding="utf-8")
+          assert "data.unused_0004 = param[1];" in evt
+          print("R5.1 snapshot token transport and queue bounds checked")
+          '@ | python -
+          if ($LASTEXITCODE -ne 0) { throw 'R5.1 source patch failed' }
+          git -C upstream/client diff --check
+          if ($LASTEXITCODE -ne 0) { throw 'R5.1 diff check failed' }
+          'R5.1: per-message IME result and preedit snapshot, one-time token consumption, 256-slot input queue.' | Add-Content "$env:GITHUB_WORKSPACE/compatibility.txt"
+      - name: Configure
+        shell: pwsh
+        run: |
+          cmake -S upstream/client -B upstream/client/build/x64 -G 'Visual Studio 17 2022' -A x64 -DWOWDECOMP_DISABLE_SIGNATURE_CHECKS=OFF
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Validate upstream contracts before compiling
+        shell: pwsh
+        run: |
+          foreach ($target in @('wxl-seam-check','wxl-point-check','wxl-dbs-check','wxl-fields-check','wxl-engine-check')) {
+            cmake --build upstream/client/build/x64 --config Release --target $target --parallel 2
+            if ($LASTEXITCODE -ne 0) { throw "Upstream contract failed: $target" }
+          }
+      - name: Isolate D3D9 shaders and Lua SDK compilation
+        shell: pwsh
+        env:
+          _CL_: "/constexpr:steps16777216"
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $false
+          $failed = @()
+          $build = 'upstream/client/build/x64'
+          cmake --build $build --config Release --target wxl-core-d3d9-shaders --parallel 2
+          if ($LASTEXITCODE -ne 0) {
+            $failed += 'D3D9 shader compiler tool'
+          } else {
+            $tool = Join-Path $build 'WarcraftXL/core/Release/wxl-core-d3d9-shaders.exe'
+            $manifest = (Resolve-Path 'upstream/core/src/gx/d3d9/shaders/draw.txt').Path
+            $out = Join-Path $env:RUNNER_TEMP 'wxl-draw-preflight.inc'
+            & $tool $manifest $out
+            if ($LASTEXITCODE -ne 0 -or !(Test-Path $out -PathType Leaf)) { $failed += 'D3D9 HLSL programs' }
+            else { 'D3D9 HLSL preflight: PASS' | Add-Content "$env:GITHUB_WORKSPACE/compatibility.txt" }
+          }
+          cmake --build $build --config Release --target wxl-core-lua --parallel 2
+          if ($LASTEXITCODE -ne 0) { $failed += 'Lua SDK runtime' }
+          else { 'Lua SDK preflight: PASS' | Add-Content "$env:GITHUB_WORKSPACE/compatibility.txt" }
+          if ($failed.Count -ne 0) {
+            "Failed targets: $($failed -join ', ')" | Add-Content "$env:GITHUB_WORKSPACE/compatibility.txt"
+            throw "Isolated compilation failed: $($failed -join ', ')"
+          }
+      - name: Compile Release x64
+        shell: pwsh
+        env:
+          _CL_: "/constexpr:steps16777216"
+        run: |
+          Write-Host "MSVC constexpr evaluation budget: 16777216 steps (also inherited by nested SDK builds)"
+          cmake --build upstream/client/build/x64 --config Release --target WowClient --parallel 2
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Verify AMD64 outputs
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $root = Join-Path $env:GITHUB_WORKSPACE 'upstream/client/bin/Win'
+          $required = @('WowClient64.exe','WarcraftXL.dll','XvidDecoder.dll','Mods/wxl.lua/mod.json','Mods/wxl.lua/bin/x64/wxl-lua.dll')
+          foreach ($name in $required) {
+            if (!(Test-Path (Join-Path $root $name) -PathType Leaf)) { throw "Missing $name" }
+          }
+          $files = @(Get-Item (Join-Path $root 'WowClient64.exe'),(Join-Path $root 'WarcraftXL.dll'),(Join-Path $root 'XvidDecoder.dll')) + @(Get-ChildItem (Join-Path $root 'Mods/wxl.lua') -Recurse -File)
+          $report = @('AMD64 PE32+ build check (not a runtime test)')
+          foreach ($file in $files | Sort-Object FullName -Unique) {
+            if ($file.Extension -in @('.exe','.dll')) {
+              $s = [IO.File]::OpenRead($file.FullName)
+              $r = [IO.BinaryReader]::new($s)
+              try {
+                if ($r.ReadUInt16() -ne 0x5a4d) { throw "Invalid MZ: $file" }
+                $s.Position = 0x3c
+                $off = $r.ReadInt32()
+                $s.Position = $off
+                if ($r.ReadUInt32() -ne 0x4550 -or $r.ReadUInt16() -ne 0x8664) { throw "Not AMD64 PE: $file" }
+                $s.Position = $off + 24
+                if ($r.ReadUInt16() -ne 0x20b) { throw "Not PE32+: $file" }
+              } finally { $r.Dispose() }
+            }
+            $relative = [IO.Path]::GetRelativePath($root,$file.FullName)
+            $hash = (Get-FileHash -Algorithm SHA256 $file.FullName).Hash
+            $report += "$hash  $relative"
+          }
+          $report | Set-Content "$env:GITHUB_WORKSPACE/build-check.txt"
+          $report | Add-Content $env:GITHUB_STEP_SUMMARY
+      - name: Package verified runtime as AES-256 ZIP
+        shell: pwsh
+        env:
+          WXL_PACKAGE_PASSWORD: ${{ secrets.WXL_PACKAGE_PASSWORD }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $root = Join-Path $env:GITHUB_WORKSPACE 'upstream/client/bin/Win'
+          $stage = Join-Path $env:RUNNER_TEMP 'wxl64-runtime-stage'
+          $out = Join-Path $env:GITHUB_WORKSPACE 'WXL64_ABI046_R51_Unicode_AES.zip'
+          $seven = Join-Path $env:ProgramFiles '7-Zip/7z.exe'
+          if (!(Test-Path $seven -PathType Leaf)) { throw '7-Zip executable missing' }
+          New-Item -ItemType Directory -Path $stage | Out-Null
+          foreach ($name in @('WowClient64.exe','WarcraftXL.dll','XvidDecoder.dll')) {
+            Copy-Item (Join-Path $root $name) $stage
+          }
+          New-Item -ItemType Directory -Path (Join-Path $stage 'Mods') | Out-Null
+          Copy-Item (Join-Path $root 'Mods/wxl.lua') (Join-Path $stage 'Mods') -Recurse
+          Get-ChildItem $stage -File -Recurse | Where-Object { $_.Extension -in @('.pdb','.lib','.exp','.obj','.ilk') } | Remove-Item -Force
+          Copy-Item "$env:GITHUB_WORKSPACE/sources.json","$env:GITHUB_WORKSPACE/build-check.txt","$env:GITHUB_WORKSPACE/compatibility.txt" $stage
+          @(
+            'WXL335 R5.1 Unicode commit fix test, ABI 0.1.46'
+            'Requires your own existing WLK 3.3.5a (12340) Data folder.'
+            'Use a separate test client/profile. Do not overwrite Wow.exe or load legacy x86 DLLs.'
+            'Start WowClient64.exe. Logs/WarcraftXL.log is the runtime log.'
+            'Build validation only; not tested under Android Wine/Box64 or against an AC server.'
+            'Upstream client: https://github.com/WarcraftXL-Labs/client'
+            'Upstream core: https://github.com/WarcraftXL-Labs/core'
+            'Upstream SDK: https://github.com/WarcraftXL-Labs/sdk'
+            'Personal testing only; no authorization to redistribute upstream client is asserted.'
+          ) | Set-Content (Join-Path $stage 'README_TEST.txt')
+          Push-Location $stage
+          try {
+            $passArg = '-p' + $env:WXL_PACKAGE_PASSWORD
+            & $seven a -tzip -mem=AES256 -mm=Deflate -mx=5 $passArg $out '.\*'
+            if ($LASTEXITCODE -ne 0 -or !(Test-Path $out -PathType Leaf)) { throw 'Encrypted archive creation failed' }
+            & $seven t $passArg $out
+            if ($LASTEXITCODE -ne 0) { throw 'Encrypted archive test failed' }
+            $listing = @(& $seven l -slt $out)
+            if ($LASTEXITCODE -ne 0) { throw 'ZIP listing failed' }
+            $expected = @(Get-ChildItem $stage -File -Recurse).Count
+            if (@($listing | Where-Object { $_ -match '^Encrypted = \+' }).Count -ne $expected) { throw 'ZIP encryption count mismatch' }
+            if (@($listing | Where-Object { $_ -match '^Method = .*AES-256' }).Count -ne $expected) { throw 'ZIP encryption method mismatch' }
+            $roundtrip = Join-Path $env:RUNNER_TEMP 'wxl64-aes-roundtrip'
+            & $seven x -y $passArg ('-o' + $roundtrip) $out
+            if ($LASTEXITCODE -ne 0) { throw 'ZIP extraction test failed' }
+            foreach ($file in Get-ChildItem $stage -File -Recurse) {
+              $rel = [IO.Path]::GetRelativePath($stage,$file.FullName)
+              $copy = Join-Path $roundtrip $rel
+              if (!(Test-Path $copy -PathType Leaf)) { throw "Missing extracted file: $rel" }
+              if ((Get-FileHash $file.FullName).Hash -ne (Get-FileHash $copy).Hash) { throw "Extracted file hash mismatch: $rel" }
+            }
+            'AES-256 ZIP extraction and SHA-256 comparison: PASS' | Add-Content "$env:GITHUB_WORKSPACE/compatibility.txt"
+          } finally { Pop-Location }
+          $hash = (Get-FileHash $out -Algorithm SHA256).Hash
+          "$hash  WXL64_ABI046_R51_Unicode_AES.zip" | Set-Content "$env:GITHUB_WORKSPACE/package-sha256.txt"
+      - name: Upload encrypted personal runtime only
+        uses: actions/upload-artifact@v4
+        with:
+          name: WXL64-R51-Unicode-AES-ZIP
+          path: |
+            WXL64_ABI046_R51_Unicode_AES.zip
+            package-sha256.txt
+          if-no-files-found: error
+          retention-days: 3
+          compression-level: 0
+      - name: Upload verification report only
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: WXL64-verification
+          path: |
+            sources.json
+            build-check.txt
+            compatibility.txt
+          if-no-files-found: ignore
+          retention-days: 7
