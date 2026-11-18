@@ -57,7 +57,10 @@ jobs:
           }
       - name: Compile Release x64
         shell: pwsh
+        env:
+          _CL_: "/constexpr:steps16777216"
         run: |
+          Write-Host "MSVC constexpr evaluation budget: 16777216 steps (also inherited by nested SDK builds)"
           cmake --build upstream/client/build/x64 --config Release --target WowClient --parallel 2
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Verify AMD64 outputs
