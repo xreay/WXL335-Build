@@ -167,7 +167,7 @@ jobs:
           }
           $report | Set-Content "$env:GITHUB_WORKSPACE/build-check.txt"
           $report | Add-Content $env:GITHUB_STEP_SUMMARY
-      - name: Package verified runtime with AES-256 encryption
+      - name: Package verified runtime as AES-256 ZIP
         shell: pwsh
         env:
           WXL_PACKAGE_PASSWORD: ${{ secrets.WXL_PACKAGE_PASSWORD }}
@@ -175,7 +175,7 @@ jobs:
           $ErrorActionPreference = 'Stop'
           $root = Join-Path $env:GITHUB_WORKSPACE 'upstream/client/bin/Win'
           $stage = Join-Path $env:RUNNER_TEMP 'wxl64-runtime-stage'
-          $out = Join-Path $env:GITHUB_WORKSPACE 'WXL64_ABI046_R4_Personal.7z'
+          $out = Join-Path $env:GITHUB_WORKSPACE 'WXL64_ABI046_R4_Personal_AES.zip'
           $seven = Join-Path $env:ProgramFiles '7-Zip/7z.exe'
           if (!(Test-Path $seven -PathType Leaf)) { throw '7-Zip executable missing' }
           New-Item -ItemType Directory -Path $stage | Out-Null
@@ -200,19 +200,34 @@ jobs:
           Push-Location $stage
           try {
             $passArg = '-p' + $env:WXL_PACKAGE_PASSWORD
-            & $seven a -t7z -mhe=on -mx=5 $passArg $out '.\*'
+            & $seven a -tzip -mem=AES256 -mm=Deflate -mx=5 $passArg $out '.\*'
             if ($LASTEXITCODE -ne 0 -or !(Test-Path $out -PathType Leaf)) { throw 'Encrypted archive creation failed' }
             & $seven t $passArg $out
             if ($LASTEXITCODE -ne 0) { throw 'Encrypted archive test failed' }
+            $listing = @(& $seven l -slt $out)
+            if ($LASTEXITCODE -ne 0) { throw 'ZIP listing failed' }
+            $expected = @(Get-ChildItem $stage -File -Recurse).Count
+            if (@($listing | Where-Object { $_ -match '^Encrypted = \+' }).Count -ne $expected) { throw 'ZIP encryption count mismatch' }
+            if (@($listing | Where-Object { $_ -match '^Method = .*AES-256' }).Count -ne $expected) { throw 'ZIP encryption method mismatch' }
+            $roundtrip = Join-Path $env:RUNNER_TEMP 'wxl64-aes-roundtrip'
+            & $seven x -y $passArg ('-o' + $roundtrip) $out
+            if ($LASTEXITCODE -ne 0) { throw 'ZIP extraction test failed' }
+            foreach ($file in Get-ChildItem $stage -File -Recurse) {
+              $rel = [IO.Path]::GetRelativePath($stage,$file.FullName)
+              $copy = Join-Path $roundtrip $rel
+              if (!(Test-Path $copy -PathType Leaf)) { throw "Missing extracted file: $rel" }
+              if ((Get-FileHash $file.FullName).Hash -ne (Get-FileHash $copy).Hash) { throw "Extracted file hash mismatch: $rel" }
+            }
+            'AES-256 ZIP extraction and SHA-256 comparison: PASS' | Add-Content "$env:GITHUB_WORKSPACE/compatibility.txt"
           } finally { Pop-Location }
           $hash = (Get-FileHash $out -Algorithm SHA256).Hash
-          "$hash  WXL64_ABI046_R4_Personal.7z" | Set-Content "$env:GITHUB_WORKSPACE/package-sha256.txt"
+          "$hash  WXL64_ABI046_R4_Personal_AES.zip" | Set-Content "$env:GITHUB_WORKSPACE/package-sha256.txt"
       - name: Upload encrypted personal runtime only
         uses: actions/upload-artifact@v4
         with:
-          name: WXL64-Personal-Encrypted
+          name: WXL64-Personal-AES-ZIP
           path: |
-            WXL64_ABI046_R4_Personal.7z
+            WXL64_ABI046_R4_Personal_AES.zip
             package-sha256.txt
           if-no-files-found: error
           retention-days: 3
