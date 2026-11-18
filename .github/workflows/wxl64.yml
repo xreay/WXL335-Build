@@ -61,6 +61,30 @@ jobs:
           git -C upstream/core diff --stat
           "HLSL: 10 identifier references renamed, comments and arithmetic preserved." | Set-Content "$env:GITHUB_WORKSPACE/compatibility.txt"
           "Compiler: VS2022 x64; constexpr steps 16777216." | Add-Content "$env:GITHUB_WORKSPACE/compatibility.txt"
+      - name: Apply MSVC x64 animation intrinsics fix
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $file = Join-Path $env:GITHUB_WORKSPACE 'upstream/core/src/tuning/Animate.cpp'
+          $source = [IO.File]::ReadAllText($file)
+          $eol = if ($source.Contains([string][char]13)) { [string][char]13 + [char]10 } else { [string][char]10 }
+          $pairs = @(
+            @{old='#include <intrin.h>'; new=('#include <intrin.h>' + $eol + '#include <immintrin.h>'); count=1},
+            @{old='uint32_t mxcsr = 0;' + $eol + '        __asm__ volatile("stmxcsr %0" : "=m"(mxcsr));'; new='const uint32_t mxcsr = _mm_getcsr();'; count=1},
+            @{old='__asm__ volatile("ldmxcsr %0" : : "m"(mxcsr));'; new='_mm_setcsr(mxcsr);'; count=1},
+            @{old='__asm__ volatile("pause");'; new='_mm_pause();'; count=2}
+          )
+          foreach ($pair in $pairs) {
+            $count = [regex]::Matches($source, [regex]::Escape($pair.old)).Count
+            if ($count -ne $pair.count) { throw "Unexpected Animate.cpp match count: $count for $($pair.old)" }
+            $source = $source.Replace($pair.old, $pair.new)
+          }
+          if ([regex]::Matches($source, '\b__asm__\b').Count -ne 2) { throw 'Unexpected remaining assembly; only x86 x87 paths should remain' }
+          [IO.File]::WriteAllText($file, $source, [Text.UTF8Encoding]::new($false))
+          git -C upstream/core diff --check
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          git -C upstream/core diff --stat
+          'Animate.cpp: MXCSR save/restore and PAUSE use equivalent CPU intrinsics. x86-only x87 code unchanged.' | Add-Content "$env:GITHUB_WORKSPACE/compatibility.txt"
       - name: Configure
         shell: pwsh
         run: |
