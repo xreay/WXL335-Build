@@ -23,11 +23,23 @@ jobs:
           $PSNativeCommandUseErrorActionPreference = $true
           $root = Join-Path $env:GITHUB_WORKSPACE 'upstream'
           New-Item -ItemType Directory -Path $root | Out-Null
+          # All three sync commits advertise ABI 0.1.46.
+          $pins = [ordered]@{
+            client = '8b56c7755390dca97eb040318bd821175db209aa'
+            core   = 'f7d6cdaf4393e3b89b7ccb889b295aa871d45ca9'
+            sdk    = '2920b6e3143169a4244dde6e9d832cd7721f2489'
+          }
           $lock = [ordered]@{}
-          foreach ($repo in @('client','core','sdk')) {
+          foreach ($repo in $pins.Keys) {
             $dest = Join-Path $root $repo
-            git clone --depth 1 --recurse-submodules https://github.com/WarcraftXL-Labs/$repo.git $dest
+            git init $dest
+            git -C $dest remote add origin "https://github.com/WarcraftXL-Labs/$repo.git"
+            git -C $dest fetch --depth 1 origin $pins[$repo]
+            git -C $dest checkout --detach FETCH_HEAD
+            git -C $dest submodule update --init --recursive
             $lock[$repo] = (git -C $dest rev-parse HEAD).Trim()
+            if ($lock[$repo] -ne $pins[$repo]) { throw "Unexpected source SHA: $repo" }
+            if ((Get-Content (Join-Path $dest 'README.md') -Raw) -notmatch 'ABI-0\.1\.46') { throw "ABI badge mismatch: $repo" }
           }
           $lock | ConvertTo-Json | Set-Content "$env:GITHUB_WORKSPACE/sources.json"
           Get-Content "$env:GITHUB_WORKSPACE/sources.json"
@@ -36,6 +48,13 @@ jobs:
         run: |
           cmake -S upstream/client -B upstream/client/build/x64 -G 'Visual Studio 18 2026' -A x64 -DWOWDECOMP_DISABLE_SIGNATURE_CHECKS=OFF
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Validate upstream contracts before compiling
+        shell: pwsh
+        run: |
+          foreach ($target in @('wxl-seam-check','wxl-point-check','wxl-dbs-check','wxl-fields-check','wxl-engine-check')) {
+            cmake --build upstream/client/build/x64 --config Release --target $target --parallel 2
+            if ($LASTEXITCODE -ne 0) { throw "Upstream contract failed: $target" }
+          }
       - name: Compile Release x64
         shell: pwsh
         run: |
