@@ -1,6 +1,10 @@
 name: WXL335 R5 Unicode input
 on:
   workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/wxl64-r5-unicode.yml'
 permissions:
   contents: read
 concurrency:
