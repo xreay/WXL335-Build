@@ -1,0 +1,230 @@
+name: WXL335 x64 personal test package
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: wxl64-build
+  cancel-in-progress: false
+jobs:
+  build:
+    if: github.event.repository.private == false && github.ref == 'refs/heads/main'
+    runs-on: windows-2022
+    timeout-minutes: 180
+    steps:
+      - name: Check private package password
+        shell: pwsh
+        env:
+          WXL_PACKAGE_PASSWORD: ${{ secrets.WXL_PACKAGE_PASSWORD }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:WXL_PACKAGE_PASSWORD) -or $env:WXL_PACKAGE_PASSWORD.Length -lt 16 -or $env:WXL_PACKAGE_PASSWORD.Contains([char]10) -or $env:WXL_PACKAGE_PASSWORD.Contains([char]13)) {
+            throw 'Set repository Actions secret WXL_PACKAGE_PASSWORD (at least 16 characters, one line) before starting this workflow.'
+          }
+      - name: Acquire upstream sources
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          $root = Join-Path $env:GITHUB_WORKSPACE 'upstream'
+          New-Item -ItemType Directory -Path $root | Out-Null
+          # All three sync commits advertise ABI 0.1.46.
+          $pins = [ordered]@{
+            client = '8b56c7755390dca97eb040318bd821175db209aa'
+            core   = 'f7d6cdaf4393e3b89b7ccb889b295aa871d45ca9'
+            sdk    = '2920b6e3143169a4244dde6e9d832cd7721f2489'
+          }
+          $lock = [ordered]@{}
+          foreach ($repo in $pins.Keys) {
+            $dest = Join-Path $root $repo
+            git init $dest
+            git -C $dest remote add origin "https://github.com/WarcraftXL-Labs/$repo.git"
+            git -C $dest fetch --depth 1 origin $pins[$repo]
+            git -C $dest checkout --detach FETCH_HEAD
+            git -C $dest submodule update --init --recursive
+            $lock[$repo] = (git -C $dest rev-parse HEAD).Trim()
+            if ($lock[$repo] -ne $pins[$repo]) { throw "Unexpected source SHA: $repo" }
+            if ((Get-Content (Join-Path $dest 'README.md') -Raw) -notmatch 'ABI-0\.1\.46') { throw "ABI badge mismatch: $repo" }
+          }
+          $lock | ConvertTo-Json | Set-Content "$env:GITHUB_WORKSPACE/sources.json"
+          Get-Content "$env:GITHUB_WORKSPACE/sources.json"
+      - name: Apply targeted D3D9 HLSL identifier fix
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $shader = Join-Path $env:GITHUB_WORKSPACE 'upstream/core/src/gx/d3d9/shaders/draw.hlsl'
+          $source = [IO.File]::ReadAllText($shader)
+          $pattern = [regex]'//[^\r\n]*|\bline\b'
+          $count = @($pattern.Matches($source) | Where-Object { $_.Value -ceq 'line' }).Count
+          if ($count -ne 10) { throw "Unexpected HLSL identifier count: $count" }
+          if ($source -cmatch '\blineData\b') { throw 'Replacement identifier already exists' }
+          $fixed = $pattern.Replace($source, { param($match) if ($match.Value -ceq 'line') { 'lineData' } else { $match.Value } })
+          if (@($pattern.Matches($fixed) | Where-Object { $_.Value -ceq 'line' }).Count -ne 0) { throw 'Unpatched HLSL reserved identifier' }
+          [IO.File]::WriteAllText($shader, $fixed, [Text.UTF8Encoding]::new($false))
+          git -C upstream/core diff --check
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          git -C upstream/core diff --stat
+          "HLSL: 10 identifier references renamed, comments and arithmetic preserved." | Set-Content "$env:GITHUB_WORKSPACE/compatibility.txt"
+          "Compiler: VS2022 x64; constexpr steps 16777216." | Add-Content "$env:GITHUB_WORKSPACE/compatibility.txt"
+      - name: Apply MSVC x64 animation intrinsics fix
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $file = Join-Path $env:GITHUB_WORKSPACE 'upstream/core/src/tuning/Animate.cpp'
+          $source = [IO.File]::ReadAllText($file)
+          $eol = if ($source.Contains([string][char]13)) { [string][char]13 + [char]10 } else { [string][char]10 }
+          $pairs = @(
+            @{old='#include <intrin.h>'; new=('#include <intrin.h>' + $eol + '#include <immintrin.h>'); count=1},
+            @{old='uint32_t mxcsr = 0;' + $eol + '        __asm__ volatile("stmxcsr %0" : "=m"(mxcsr));'; new='const uint32_t mxcsr = _mm_getcsr();'; count=1},
+            @{old='__asm__ volatile("ldmxcsr %0" : : "m"(mxcsr));'; new='_mm_setcsr(mxcsr);'; count=1},
+            @{old='__asm__ volatile("pause");'; new='_mm_pause();'; count=2}
+          )
+          foreach ($pair in $pairs) {
+            $count = [regex]::Matches($source, [regex]::Escape($pair.old)).Count
+            if ($count -ne $pair.count) { throw "Unexpected Animate.cpp match count: $count for $($pair.old)" }
+            $source = $source.Replace($pair.old, $pair.new)
+          }
+          if ([regex]::Matches($source, '\b__asm__\b').Count -ne 2) { throw 'Unexpected remaining assembly; only x86 x87 paths should remain' }
+          [IO.File]::WriteAllText($file, $source, [Text.UTF8Encoding]::new($false))
+          git -C upstream/core diff --check
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          git -C upstream/core diff --stat
+          'Animate.cpp: MXCSR save/restore and PAUSE use equivalent CPU intrinsics. x86-only x87 code unchanged.' | Add-Content "$env:GITHUB_WORKSPACE/compatibility.txt"
+      - name: Configure
+        shell: pwsh
+        run: |
+          cmake -S upstream/client -B upstream/client/build/x64 -G 'Visual Studio 17 2022' -A x64 -DWOWDECOMP_DISABLE_SIGNATURE_CHECKS=OFF
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Validate upstream contracts before compiling
+        shell: pwsh
+        run: |
+          foreach ($target in @('wxl-seam-check','wxl-point-check','wxl-dbs-check','wxl-fields-check','wxl-engine-check')) {
+            cmake --build upstream/client/build/x64 --config Release --target $target --parallel 2
+            if ($LASTEXITCODE -ne 0) { throw "Upstream contract failed: $target" }
+          }
+      - name: Isolate D3D9 shaders and Lua SDK compilation
+        shell: pwsh
+        env:
+          _CL_: "/constexpr:steps16777216"
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $false
+          $failed = @()
+          $build = 'upstream/client/build/x64'
+          cmake --build $build --config Release --target wxl-core-d3d9-shaders --parallel 2
+          if ($LASTEXITCODE -ne 0) {
+            $failed += 'D3D9 shader compiler tool'
+          } else {
+            $tool = Join-Path $build 'WarcraftXL/core/Release/wxl-core-d3d9-shaders.exe'
+            $manifest = (Resolve-Path 'upstream/core/src/gx/d3d9/shaders/draw.txt').Path
+            $out = Join-Path $env:RUNNER_TEMP 'wxl-draw-preflight.inc'
+            & $tool $manifest $out
+            if ($LASTEXITCODE -ne 0 -or !(Test-Path $out -PathType Leaf)) { $failed += 'D3D9 HLSL programs' }
+            else { 'D3D9 HLSL preflight: PASS' | Add-Content "$env:GITHUB_WORKSPACE/compatibility.txt" }
+          }
+          cmake --build $build --config Release --target wxl-core-lua --parallel 2
+          if ($LASTEXITCODE -ne 0) { $failed += 'Lua SDK runtime' }
+          else { 'Lua SDK preflight: PASS' | Add-Content "$env:GITHUB_WORKSPACE/compatibility.txt" }
+          if ($failed.Count -ne 0) {
+            "Failed targets: $($failed -join ', ')" | Add-Content "$env:GITHUB_WORKSPACE/compatibility.txt"
+            throw "Isolated compilation failed: $($failed -join ', ')"
+          }
+      - name: Compile Release x64
+        shell: pwsh
+        env:
+          _CL_: "/constexpr:steps16777216"
+        run: |
+          Write-Host "MSVC constexpr evaluation budget: 16777216 steps (also inherited by nested SDK builds)"
+          cmake --build upstream/client/build/x64 --config Release --target WowClient --parallel 2
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Verify AMD64 outputs
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $root = Join-Path $env:GITHUB_WORKSPACE 'upstream/client/bin/Win'
+          $required = @('WowClient64.exe','WarcraftXL.dll','XvidDecoder.dll','Mods/wxl.lua/mod.json','Mods/wxl.lua/bin/x64/wxl-lua.dll')
+          foreach ($name in $required) {
+            if (!(Test-Path (Join-Path $root $name) -PathType Leaf)) { throw "Missing $name" }
+          }
+          $files = @(Get-Item (Join-Path $root 'WowClient64.exe'),(Join-Path $root 'WarcraftXL.dll'),(Join-Path $root 'XvidDecoder.dll')) + @(Get-ChildItem (Join-Path $root 'Mods/wxl.lua') -Recurse -File)
+          $report = @('AMD64 PE32+ build check (not a runtime test)')
+          foreach ($file in $files | Sort-Object FullName -Unique) {
+            if ($file.Extension -in @('.exe','.dll')) {
+              $s = [IO.File]::OpenRead($file.FullName)
+              $r = [IO.BinaryReader]::new($s)
+              try {
+                if ($r.ReadUInt16() -ne 0x5a4d) { throw "Invalid MZ: $file" }
+                $s.Position = 0x3c
+                $off = $r.ReadInt32()
+                $s.Position = $off
+                if ($r.ReadUInt32() -ne 0x4550 -or $r.ReadUInt16() -ne 0x8664) { throw "Not AMD64 PE: $file" }
+                $s.Position = $off + 24
+                if ($r.ReadUInt16() -ne 0x20b) { throw "Not PE32+: $file" }
+              } finally { $r.Dispose() }
+            }
+            $relative = [IO.Path]::GetRelativePath($root,$file.FullName)
+            $hash = (Get-FileHash -Algorithm SHA256 $file.FullName).Hash
+            $report += "$hash  $relative"
+          }
+          $report | Set-Content "$env:GITHUB_WORKSPACE/build-check.txt"
+          $report | Add-Content $env:GITHUB_STEP_SUMMARY
+      - name: Package verified runtime with AES-256 encryption
+        shell: pwsh
+        env:
+          WXL_PACKAGE_PASSWORD: ${{ secrets.WXL_PACKAGE_PASSWORD }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $root = Join-Path $env:GITHUB_WORKSPACE 'upstream/client/bin/Win'
+          $stage = Join-Path $env:RUNNER_TEMP 'wxl64-runtime-stage'
+          $out = Join-Path $env:GITHUB_WORKSPACE 'WXL64_ABI046_R4_Personal.7z'
+          $seven = Join-Path $env:ProgramFiles '7-Zip/7z.exe'
+          if (!(Test-Path $seven -PathType Leaf)) { throw '7-Zip executable missing' }
+          New-Item -ItemType Directory -Path $stage | Out-Null
+          foreach ($name in @('WowClient64.exe','WarcraftXL.dll','XvidDecoder.dll')) {
+            Copy-Item (Join-Path $root $name) $stage
+          }
+          New-Item -ItemType Directory -Path (Join-Path $stage 'Mods') | Out-Null
+          Copy-Item (Join-Path $root 'Mods/wxl.lua') (Join-Path $stage 'Mods') -Recurse
+          Get-ChildItem $stage -File -Recurse | Where-Object { $_.Extension -in @('.pdb','.lib','.exp','.obj','.ilk') } | Remove-Item -Force
+          Copy-Item "$env:GITHUB_WORKSPACE/sources.json","$env:GITHUB_WORKSPACE/build-check.txt","$env:GITHUB_WORKSPACE/compatibility.txt" $stage
+          @(
+            'WXL335 x64 personal compatibility test, ABI 0.1.46'
+            'Requires your own existing WLK 3.3.5a (12340) Data folder.'
+            'Use a separate test client/profile. Do not overwrite Wow.exe or load legacy x86 DLLs.'
+            'Start WowClient64.exe. Logs/WarcraftXL.log is the runtime log.'
+            'Build validation only; not tested under Android Wine/Box64 or against an AC server.'
+            'Upstream client: https://github.com/WarcraftXL-Labs/client'
+            'Upstream core: https://github.com/WarcraftXL-Labs/core'
+            'Upstream SDK: https://github.com/WarcraftXL-Labs/sdk'
+            'Personal testing only; no authorization to redistribute upstream client is asserted.'
+          ) | Set-Content (Join-Path $stage 'README_TEST.txt')
+          Push-Location $stage
+          try {
+            $passArg = '-p' + $env:WXL_PACKAGE_PASSWORD
+            & $seven a -t7z -mhe=on -mx=5 $passArg $out '.\*'
+            if ($LASTEXITCODE -ne 0 -or !(Test-Path $out -PathType Leaf)) { throw 'Encrypted archive creation failed' }
+            & $seven t $passArg $out
+            if ($LASTEXITCODE -ne 0) { throw 'Encrypted archive test failed' }
+          } finally { Pop-Location }
+          $hash = (Get-FileHash $out -Algorithm SHA256).Hash
+          "$hash  WXL64_ABI046_R4_Personal.7z" | Set-Content "$env:GITHUB_WORKSPACE/package-sha256.txt"
+      - name: Upload encrypted personal runtime only
+        uses: actions/upload-artifact@v4
+        with:
+          name: WXL64-Personal-Encrypted
+          path: |
+            WXL64_ABI046_R4_Personal.7z
+            package-sha256.txt
+          if-no-files-found: error
+          retention-days: 3
+          compression-level: 0
+      - name: Upload verification report only
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: WXL64-verification
+          path: |
+            sources.json
+            build-check.txt
+            compatibility.txt
+          if-no-files-found: ignore
+          retention-days: 7
