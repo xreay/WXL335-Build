@@ -1,0 +1,84 @@
+name: WXL335 x64 build verification
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/wxl64.yml'
+permissions:
+  contents: read
+concurrency:
+  group: wxl64-build
+  cancel-in-progress: false
+jobs:
+  build:
+    if: github.event.repository.private == false
+    runs-on: windows-2025-vs2026
+    timeout-minutes: 180
+    steps:
+      - name: Acquire upstream sources
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          $root = Join-Path $env:GITHUB_WORKSPACE 'upstream'
+          New-Item -ItemType Directory -Path $root | Out-Null
+          $lock = [ordered]@{}
+          foreach ($repo in @('client','core','sdk')) {
+            $dest = Join-Path $root $repo
+            git clone --depth 1 --recurse-submodules https://github.com/WarcraftXL-Labs/$repo.git $dest
+            $lock[$repo] = (git -C $dest rev-parse HEAD).Trim()
+          }
+          $lock | ConvertTo-Json | Set-Content "$env:GITHUB_WORKSPACE/sources.json"
+          Get-Content "$env:GITHUB_WORKSPACE/sources.json"
+      - name: Configure
+        shell: pwsh
+        run: |
+          cmake -S upstream/client -B upstream/client/build/x64 -G 'Visual Studio 18 2026' -A x64 -DWOWDECOMP_DISABLE_SIGNATURE_CHECKS=OFF
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Compile Release x64
+        shell: pwsh
+        run: |
+          cmake --build upstream/client/build/x64 --config Release --target WowClient --parallel 2
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Verify AMD64 outputs
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $root = Join-Path $env:GITHUB_WORKSPACE 'upstream/client/bin/Win'
+          $required = @('WowClient64.exe','WarcraftXL.dll','XvidDecoder.dll','Mods/wxl.lua/mod.json','Mods/wxl.lua/bin/x64/wxl-lua.dll')
+          foreach ($name in $required) {
+            if (!(Test-Path (Join-Path $root $name) -PathType Leaf)) { throw "Missing $name" }
+          }
+          $files = @(Get-Item (Join-Path $root 'WowClient64.exe'),(Join-Path $root 'WarcraftXL.dll'),(Join-Path $root 'XvidDecoder.dll')) + @(Get-ChildItem (Join-Path $root 'Mods/wxl.lua') -Recurse -File)
+          $report = @('AMD64 PE32+ build check (not a runtime test)')
+          foreach ($file in $files | Sort-Object FullName -Unique) {
+            if ($file.Extension -in @('.exe','.dll')) {
+              $s = [IO.File]::OpenRead($file.FullName)
+              $r = [IO.BinaryReader]::new($s)
+              try {
+                if ($r.ReadUInt16() -ne 0x5a4d) { throw "Invalid MZ: $file" }
+                $s.Position = 0x3c
+                $off = $r.ReadInt32()
+                $s.Position = $off
+                if ($r.ReadUInt32() -ne 0x4550 -or $r.ReadUInt16() -ne 0x8664) { throw "Not AMD64 PE: $file" }
+                $s.Position = $off + 24
+                if ($r.ReadUInt16() -ne 0x20b) { throw "Not PE32+: $file" }
+              } finally { $r.Dispose() }
+            }
+            $relative = [IO.Path]::GetRelativePath($root,$file.FullName)
+            $hash = (Get-FileHash -Algorithm SHA256 $file.FullName).Hash
+            $report += "$hash  $relative"
+          }
+          $report | Set-Content "$env:GITHUB_WORKSPACE/build-check.txt"
+          $report | Add-Content $env:GITHUB_STEP_SUMMARY
+      - name: Upload verification report only
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: WXL64-verification
+          path: |
+            sources.json
+            build-check.txt
+          if-no-files-found: ignore
+          retention-days: 7
