@@ -13,7 +13,7 @@ concurrency:
 jobs:
   build:
     if: github.event.repository.private == false
-    runs-on: windows-2025-vs2026
+    runs-on: windows-2022
     timeout-minutes: 180
     steps:
       - name: Acquire upstream sources
@@ -43,10 +43,28 @@ jobs:
           }
           $lock | ConvertTo-Json | Set-Content "$env:GITHUB_WORKSPACE/sources.json"
           Get-Content "$env:GITHUB_WORKSPACE/sources.json"
+      - name: Apply targeted D3D9 HLSL identifier fix
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $shader = Join-Path $env:GITHUB_WORKSPACE 'upstream/core/src/gx/d3d9/shaders/draw.hlsl'
+          $source = [IO.File]::ReadAllText($shader)
+          $pattern = [regex]'//[^\r\n]*|\bline\b'
+          $count = @($pattern.Matches($source) | Where-Object { $_.Value -ceq 'line' }).Count
+          if ($count -ne 10) { throw "Unexpected HLSL identifier count: $count" }
+          if ($source -cmatch '\blineData\b') { throw 'Replacement identifier already exists' }
+          $fixed = $pattern.Replace($source, { param($match) if ($match.Value -ceq 'line') { 'lineData' } else { $match.Value } })
+          if (@($pattern.Matches($fixed) | Where-Object { $_.Value -ceq 'line' }).Count -ne 0) { throw 'Unpatched HLSL reserved identifier' }
+          [IO.File]::WriteAllText($shader, $fixed, [Text.UTF8Encoding]::new($false))
+          git -C upstream/core diff --check
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          git -C upstream/core diff --stat
+          "HLSL: 10 identifier references renamed, comments and arithmetic preserved." | Set-Content "$env:GITHUB_WORKSPACE/compatibility.txt"
+          "Compiler: VS2022 x64; constexpr steps 16777216." | Add-Content "$env:GITHUB_WORKSPACE/compatibility.txt"
       - name: Configure
         shell: pwsh
         run: |
-          cmake -S upstream/client -B upstream/client/build/x64 -G 'Visual Studio 18 2026' -A x64 -DWOWDECOMP_DISABLE_SIGNATURE_CHECKS=OFF
+          cmake -S upstream/client -B upstream/client/build/x64 -G 'Visual Studio 17 2022' -A x64 -DWOWDECOMP_DISABLE_SIGNATURE_CHECKS=OFF
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Validate upstream contracts before compiling
         shell: pwsh
@@ -54,6 +72,33 @@ jobs:
           foreach ($target in @('wxl-seam-check','wxl-point-check','wxl-dbs-check','wxl-fields-check','wxl-engine-check')) {
             cmake --build upstream/client/build/x64 --config Release --target $target --parallel 2
             if ($LASTEXITCODE -ne 0) { throw "Upstream contract failed: $target" }
+          }
+      - name: Isolate D3D9 shaders and Lua SDK compilation
+        shell: pwsh
+        env:
+          _CL_: "/constexpr:steps16777216"
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $false
+          $failed = @()
+          $build = 'upstream/client/build/x64'
+          cmake --build $build --config Release --target wxl-core-d3d9-shaders --parallel 2
+          if ($LASTEXITCODE -ne 0) {
+            $failed += 'D3D9 shader compiler tool'
+          } else {
+            $tool = Join-Path $build 'WarcraftXL/core/Release/wxl-core-d3d9-shaders.exe'
+            $manifest = (Resolve-Path 'upstream/core/src/gx/d3d9/shaders/draw.txt').Path
+            $out = Join-Path $env:RUNNER_TEMP 'wxl-draw-preflight.inc'
+            & $tool $manifest $out
+            if ($LASTEXITCODE -ne 0 -or !(Test-Path $out -PathType Leaf)) { $failed += 'D3D9 HLSL programs' }
+            else { 'D3D9 HLSL preflight: PASS' | Add-Content "$env:GITHUB_WORKSPACE/compatibility.txt" }
+          }
+          cmake --build $build --config Release --target wxl-core-lua --parallel 2
+          if ($LASTEXITCODE -ne 0) { $failed += 'Lua SDK runtime' }
+          else { 'Lua SDK preflight: PASS' | Add-Content "$env:GITHUB_WORKSPACE/compatibility.txt" }
+          if ($failed.Count -ne 0) {
+            "Failed targets: $($failed -join ', ')" | Add-Content "$env:GITHUB_WORKSPACE/compatibility.txt"
+            throw "Isolated compilation failed: $($failed -join ', ')"
           }
       - name: Compile Release x64
         shell: pwsh
@@ -102,5 +147,6 @@ jobs:
           path: |
             sources.json
             build-check.txt
+            compatibility.txt
           if-no-files-found: ignore
           retention-days: 7
