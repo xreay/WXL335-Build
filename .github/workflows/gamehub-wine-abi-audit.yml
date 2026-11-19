@@ -1,0 +1,75 @@
+name: GameHub Wine reference ABI and clipboard audit
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/gamehub-wine-abi-audit.yml'
+permissions:
+  contents: read
+jobs:
+  audit:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Fetch pinned public reference Wine component
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fL --retry 3 'https://github.com/Producdevity/gamehub-lite-api/releases/download/Components/wine_11_arm64x_out.tar.zst' -o wine.tar.zst
+          test "$(stat -c%s wine.tar.zst)" = 251416426
+          echo '19f1e3ed3fe6985953039820681faa0f  wine.tar.zst' | md5sum -c
+          sha256sum wine.tar.zst
+          tar --zstd -tf wine.tar.zst > wine-members.txt
+          grep -Ei '(^|/)(winex11\.so|win32u\.so|ntdll\.so|user32\.dll|wineserver|wine|[^/]*license[^/]*|[^/]*source[^/]*|[^/]*version[^/]*)$' wine-members.txt | head -100 || true
+      - name: Inspect reference ABI without executing foreign code
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir extracted
+          python - <<'PY'
+          import re, subprocess
+          paths = open('wine-members.txt').read().splitlines()
+          candidates = [p for p in paths if re.search(r'(^|/)(winex11\.so|win32u\.so|ntdll\.so|user32\.dll|wineserver|wine)$',p)]
+          assert any(p.endswith('/winex11.so') for p in candidates), candidates
+          for p in candidates:
+              assert not p.startswith('/') and '..' not in p.split('/')
+          subprocess.run(['tar','--zstd','-xf','wine.tar.zst','-C','extracted','--no-recursion','--',*candidates],check=True)
+          PY
+          {
+            while IFS= read -r -d '' f; do
+              echo "===== $f ====="
+              file "$f"
+              sha256sum "$f"
+              if readelf -h "$f" >/dev/null 2>&1; then
+                readelf -h "$f" | grep -E 'Class:|Machine:|Type:'
+                readelf -d "$f" | grep -E 'NEEDED|SONAME|RUNPATH|RPATH' || true
+                readelf -n "$f" | grep -E 'Build ID|Android' || true
+                readelf -Ws "$f" | grep -Ei 'XLookupString|XmbLookupString|XGetKeyboardMapping|XkbKeycodeToKeysym|XRefreshKeyboardMapping|NtUserSendHardwareInput|__wine_unix_call|X11DRV_KeyEvent' || true
+              fi
+              strings -a "$f" | grep -Ei 'WINE_(FROM|TO)_ANDROID_CLIPBOARD|android_clipboard|127\.0\.0\.1|proton-11|wine-11|android-sysvshm|X11DRV_KeyEvent|X11DRV_ToUnicodeEx|XmbLookupString' | sort -u | head -100 || true
+            done < <(find extracted -type f -print0)
+          } | tee wine-abi.txt
+      - name: Fetch pinned public engine reference
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fL --retry 3 'https://github.com/TideGear/GameScrub/releases/download/pcengine-plugin-109/pcengine-plugin-109.apk' -o engine.apk
+          echo '725493a0f7f2cacc8acbb6d9d0b37378aa5aa5ad5c84c5537df236fc2a38514d  engine.apk' | sha256sum -c
+          python - <<'PY'
+          import re, zipfile
+          z=zipfile.ZipFile('engine.apk')
+          needles=[b'WINE_FROM_ANDROID_CLIPBOARD',b'WINE_TO_ANDROID_CLIPBOARD',b'android_clipboard',b'ClipboardManager',b'getPrimaryClip',b'setPrimaryClip']
+          for n in z.namelist():
+              if re.fullmatch(r'classes\d*\.dex', n) or n.endswith(('/libxserver.so','/libwinemu.so')):
+                  b=z.read(n)
+                  print(n,len(b),[(x.decode(),b.count(x)) for x in needles if x in b])
+          PY
+      - name: Upload text evidence only
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: GameHub-Wine-ABI-reference-evidence
+          path: wine-abi.txt
+          if-no-files-found: ignore
+          retention-days: 7
