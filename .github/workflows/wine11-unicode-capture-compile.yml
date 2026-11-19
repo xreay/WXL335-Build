@@ -1,0 +1,68 @@
+name: R6 Wine Unicode capture ARM64 reference compile
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/wine11-unicode-capture-compile.yml'
+permissions:
+  contents: read
+jobs:
+  reference:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install reference build tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends clang lld llvm bison flex libx11-dev libxext-dev libxkbcommon-dev libxkbfile-dev libxi-dev libxrandr-dev libxrender-dev libxfixes-dev libxcursor-dev libxcomposite-dev libfreetype6-dev libfontconfig1-dev libgl-dev libvulkan-dev libgnutls28-dev libunwind-dev
+      - name: Fetch Wine 11.0 reference source
+        run: |
+          git clone --depth 1 --branch wine-11.0 https://github.com/wine-mirror/wine.git wine-ref
+          git -C wine-ref rev-parse HEAD | tee reference-source.txt
+          uname -m | tee reference-architecture.txt
+          test "$(uname -m)" = aarch64
+      - name: Configure reference build
+        run: |
+          mkdir wine-build
+          cd wine-build
+          ../wine-ref/configure --disable-tests --without-wayland --without-gstreamer --without-alsa --without-pulse --without-cups --without-sane --without-oss --without-v4l2 --enable-archs=aarch64 --with-mingw=clang > configure.out 2>&1 || { tail -100 configure.out; exit 1; }
+          grep -E '^dlls/winex11\.drv/[^ :]*keyboard\.o:' Makefile | head -10 || true
+          # Require a Unix object rule, not a PE-only compilation.
+          target=$(sed -nE 's/^(dlls\/winex11\.drv\/[^ :]*keyboard\.o):.*/\1/p' Makefile | grep -v -- '-windows/' | head -1)
+          test -n "$target"
+          echo "$target" > keyboard-target.txt
+      - name: Compile clean reference object
+        run: |
+          cd wine-build
+          target=$(cat keyboard-target.txt)
+          set -o pipefail
+          make -j2 "$target" 2>&1 | tee ../baseline-compile.txt
+          readelf -h "$target" | tee ../baseline-elf.txt
+          grep -q 'AArch64' ../baseline-elf.txt
+      - name: Apply and compile opt-in candidate
+        run: |
+          python research/gamehub-input/wine11_capture_candidate.py wine-ref
+          git -C wine-ref diff --check
+          cd wine-build
+          target=$(cat keyboard-target.txt)
+          rm -f "$target"
+          set -o pipefail
+          make -j2 "$target" 2>&1 | tee ../candidate-compile.txt
+          readelf -h "$target" | tee ../candidate-elf.txt
+          grep -q 'AArch64' ../candidate-elf.txt
+          echo 'PASS: vanilla Wine 11.0 ARM64 Unix keyboard translation object compiled; this is NOT a GameHub-compatible binary or runtime test.' | tee ../reference-result.txt
+      - name: Upload build evidence only
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: R6-Wine11-reference-compile-evidence
+          path: |
+            reference-*.txt
+            baseline-*.txt
+            candidate-*.txt
+            wine-build/configure.out
+            wine-build/keyboard-target.txt
+          if-no-files-found: ignore
+          retention-days: 7
