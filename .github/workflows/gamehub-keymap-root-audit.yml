@@ -1,0 +1,120 @@
+name: GameHub keymap root cause audit
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/gamehub-keymap-root-audit.yml'
+permissions:
+  contents: read
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - name: Verify and extract reference
+        run: |
+          curl -fL --retry 2 -o pcengine.apk https://github.com/TideGear/GameScrub/releases/download/pcengine-plugin-109/pcengine-plugin-109.apk
+          echo '725493a0f7f2cacc8acbb6d9d0b37378aa5aa5ad5c84c5537df236fc2a38514d  pcengine.apk' | sha256sum -c -
+          unzip -p pcengine.apk lib/arm64-v8a/libxserver.so > libxserver.so
+          python -m pip install --disable-pip-version-check capstone==5.0.6 pyelftools==0.32
+      - name: Resolve key mapping fallback and queue scheduling
+        run: |
+          python - <<'PY' | tee keymap-root.txt
+          from pathlib import Path
+          from capstone import Cs,CS_ARCH_ARM64,CS_MODE_LITTLE_ENDIAN
+          from elftools.elf.elffile import ELFFile
+          import re
+          b=Path('libxserver.so').read_bytes()
+          f=open('libxserver.so','rb'); e=ELFFile(f)
+          loads=[s for s in e.iter_segments() if s['p_type']=='PT_LOAD']
+          def off(a,n=4,x=False):
+              for s in loads:
+                  v,z,o=s['p_vaddr'],s['p_filesz'],s['p_offset']
+                  if v<=a and a+n<=v+z and (not x or s['p_flags']&1):return o+a-v
+          cs=Cs(CS_ARCH_ARM64,CS_MODE_LITTLE_ENDIAN)
+          imports={}
+          for sec in e.iter_sections():
+              if sec['sh_type'] not in ('SHT_RELA','SHT_REL'):continue
+              st=e.get_section(sec['sh_link'])
+              for r in sec.iter_relocations():
+                  if r['r_info_sym']:imports[r['r_offset']]=st.get_symbol(r['r_info_sym']).name
+          plt=e.get_section_by_name('.plt'); stubs={}
+          for a in range(plt['sh_addr'],plt['sh_addr']+plt['sh_size'],16):
+              o=off(a,16,True)
+              if o is None:continue
+              ins=list(cs.disasm(b[o:o+16],a))
+              try:
+                  if ins[0].mnemonic=='adrp' and ins[1].mnemonic=='ldr':
+                      got=int(ins[0].op_str.split('#')[1],0)+int(ins[1].op_str.split('#')[1].split(']')[0],0)
+                      if got in imports:stubs[a]=imports[got]
+              except (IndexError,ValueError):pass
+          def dis(a,z):
+              o=off(a,z-a,True)
+              assert o is not None
+              return list(cs.disasm(b[o:o+z-a],a))
+          def text(a):
+              o=off(a,1)
+              if o is None:return ''
+              v=b[o:o+140].split(b'\0')[0]
+              return v.decode('ascii') if len(v)>3 and all(32<=x<127 for x in v) else ''
+          def dump(label,a,z):
+              print('SECTION',label,hex(a),hex(z))
+              regs={}
+              for i in dis(a,z):
+                  ann=[]
+                  m=re.fullmatch(r'(x\d+), #([0-9xa-f]+)',i.op_str)
+                  if i.mnemonic in ('adr','adrp') and m:
+                      regs[m[1]]=int(m[2],0)
+                      t=text(regs[m[1]])
+                      if t:ann.append(t)
+                  m=re.fullmatch(r'(x\d+), (x\d+), #([0-9xa-f]+)',i.op_str)
+                  if i.mnemonic=='add' and m and m[2] in regs:
+                      regs[m[1]]=regs[m[2]]+int(m[3],0)
+                      t=text(regs[m[1]])
+                      if t:ann.append(t)
+                  if i.mnemonic in ('bl','b'):
+                      try:
+                          t=int(i.op_str[1:],0)
+                          if t in stubs:ann.append(stubs[t])
+                      except ValueError:pass
+                  print(f'{i.address:08x} {i.mnemonic:8s} {i.op_str}'+(' ; '+' | '.join(ann) if ann else ''))
+          dump('full key injection including missing-key fallback',0xc951c,0xca19c)
+          dump('key lookup',0xc9180,0xc9444)
+          dump('text callback',0xbefc8,0xbf140)
+          # Scan branch references to the callback queue head. Report disassembly for scheduling candidates.
+          # Queue insertion uses 0x4e7000+0xdd8 mutex and 0x4de000+0xe58 tail.
+          print('SCHEDULER_REFERENCES')
+          for s in loads:
+              if not s['p_flags']&1:continue
+              o,v,z=s['p_offset'],s['p_vaddr'],s['p_filesz']
+              # Check direct calls to the known work-queue insertion and drain-related functions.
+              for i in cs.disasm(b[o:o+z],v):
+                  if i.mnemonic=='bl' and i.op_str in ('#0x1eb874','#0x1c7eb0'):
+                      print('CALLER',hex(i.address),i.op_str)
+          PY
+      - name: Demonstrate mapping race model (not target execution)
+        run: |
+          python - <<'PY' | tee mapping-model.txt
+          # Model late keycode translation. A fixed delay alone cannot give a causal guarantee.
+          def late_lookup(chars,stable):
+              keymap={}; events=[]
+              for c in chars:
+                  key=c if stable else 255
+                  keymap[key]=c
+                  events.append(key)
+              return ''.join(keymap[k] for k in events)
+          for s in ['输入','中国','原生中文输入','哈哈','魔兽世界','A中B文','𠀀中']:
+              bad=late_lookup(s,False);good=late_lookup(s,True)
+              assert good==s
+              print(repr(s),'reuse:',repr(bad),'stable:',repr(good))
+          print('MODEL ONLY: does not establish the actual target uses keycode 255 or that every event is delayed.')
+          PY
+      - name: Save evidence only
+        uses: actions/upload-artifact@v4
+        with:
+          name: gamehub-keymap-root-evidence
+          path: |
+            keymap-root.txt
+            mapping-model.txt
+          retention-days: 7
