@@ -1,0 +1,56 @@
+name: GameHub input audit - call path
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/gamehub-input-audit-deep.yml'
+permissions:
+  contents: read
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Download pinned reference and decompiler
+        run: |
+          curl -fL --retry 2 -o pcengine.apk https://github.com/TideGear/GameScrub/releases/download/pcengine-plugin-109/pcengine-plugin-109.apk
+          echo '725493a0f7f2cacc8acbb6d9d0b37378aa5aa5ad5c84c5537df236fc2a38514d  pcengine.apk' | sha256sum -c -
+          curl -fL --retry 2 -o jadx.zip https://github.com/skylot/jadx/releases/download/v1.5.3/jadx-1.5.3.zip
+          echo '8280f3799c0273fe797a2bcd90258c943e451fd195f13d05400de5e6451d15ec  jadx.zip' | sha256sum -c -
+          unzip -q jadx.zip -d jadx
+      - name: Resolve actual input call path
+        run: |
+          mkdir -p analysis
+          jadx/bin/jadx --no-res --show-bad-code --single-class xjp.esb --single-class-output analysis/esb.java pcengine.apk
+          jadx/bin/jadx --no-res --show-bad-code --single-class xjp.c8c --single-class-output analysis/c8c.java pcengine.apk
+          jadx/bin/jadx --no-res --show-bad-code --single-class com.winemu.core.server.XServer --single-class-output analysis/XServer.java pcengine.apk
+          python - <<'PY' | tee call-path.txt
+          from pathlib import Path
+          import re
+          for p in Path('analysis').glob('*.java'):
+              print('CLASS',p.name)
+              lines=p.read_text(errors='replace').splitlines()
+              # Narrow API summaries, not full proprietary source distribution.
+              for i,line in enumerate(lines):
+                  if re.search(r'\b(commitText|setComposingText|sendTextEvent|onCreateInputConnection|finishComposingText|sendKeyEvent|ClipboardManager|native)\b',line):
+                      print(i+1,line.strip()[:350])
+          PY
+          python - <<'PY'
+          import zipfile
+          z=zipfile.ZipFile('pcengine.apk')
+          for name in ['lib/arm64-v8a/libxserver.so','lib/arm64-v8a/libwinemu.so']:
+              z.extract(name,'analysis')
+          PY
+          for f in analysis/lib/arm64-v8a/*.so; do
+            echo "NATIVE $f"
+            readelf -Ws "$f" | grep -Ei 'sendTextEvent|unicode|clipboard|keymap|keyevent|XSendEvent|XTestFakeKey|XChangeKeyboardMapping|XSetSelectionOwner|XConvertSelection' || true
+          done | tee native-symbols.txt
+      - name: Upload narrow audit report
+        uses: actions/upload-artifact@v4
+        with:
+          name: gamehub-input-call-path
+          path: |
+            call-path.txt
+            native-symbols.txt
+          retention-days: 7
