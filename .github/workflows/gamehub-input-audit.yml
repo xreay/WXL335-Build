@@ -1,0 +1,83 @@
+name: GameHub PC engine input audit
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/gamehub-input-audit.yml'
+permissions:
+  contents: read
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Fetch reference plugin and verify
+        run: |
+          curl --fail --location --retry 2 --output pcengine.apk https://github.com/TideGear/GameScrub/releases/download/pcengine-plugin-109/pcengine-plugin-109.apk
+          echo '725493a0f7f2cacc8acbb6d9d0b37378aa5aa5ad5c84c5537df236fc2a38514d  pcengine.apk' | sha256sum -c -
+      - name: Inspect DEX definitions and input API call sites
+        run: |
+          python - <<'PY' | tee input-audit.txt
+          import zipfile,struct,re
+          z=zipfile.ZipFile('pcengine.apk')
+          for i in z.infolist():
+              if i.filename.endswith(('.dex','.so','.apk','.zip','.xz','.zst','.tar')):
+                  print('FILE',i.filename,i.file_size)
+          api=re.compile(r'commitText|setComposingText|finishComposingText|onCreateInputConnection|sendUnicode|sendText|sendChar|clipboard|pasteText|inputText|injectText|sendKeyboard|sendKeyEvent',re.I)
+          for name in z.namelist():
+              if not re.fullmatch(r'classes\d*\.dex',name): continue
+              b=z.read(name)
+              def u32(o):return struct.unpack_from('<I',b,o)[0]
+              def u16(o):return struct.unpack_from('<H',b,o)[0]
+              def leb(o):
+                  v=s=0
+                  while True:
+                      x=b[o];o+=1;v|=(x&127)<<s;s+=7
+                      if x<128:return v,o
+              def st(o):
+                  _,o=leb(o)
+                  return b[o:b.index(0,o)].decode('utf8','replace')
+              sn,so,tn,to,pn,po,fn,fo,mn,mo,cn,co=struct.unpack_from('<12I',b,56)
+              strings=[st(u32(so+i*4)) for i in range(sn)]
+              types=[strings[u32(to+i*4)] for i in range(tn)]
+              methods=[(types[u16(mo+i*8)],strings[u32(mo+i*8+4)]) for i in range(mn)]
+              print('DEX',name,'classes',cn,'methods',mn)
+              for cls,m in methods:
+                  if api.search(m):print('METHOD_REF',cls,m)
+              for j in range(cn):
+                  o=u32(co+j*32+24)
+                  if not o:continue
+                  nums=[]
+                  for _ in range(4):
+                      v,o=leb(o);nums.append(v)
+                  for _ in range(nums[0]+nums[1]):
+                      _,o=leb(o);_,o=leb(o)
+                  for count in nums[2:]:
+                      idx=0
+                      for _ in range(count):
+                          delta,o=leb(o);idx+=delta
+                          _,o=leb(o);addr,o=leb(o)
+                          cls,m=methods[idx]
+                          if not addr:continue
+                          n=u32(addr+12)
+                          if not api.search(m):continue
+                          print('DEFINITION',cls,m,'code_units',n)
+                          # Conservative candidate invoke scan; locations may include operand false positives.
+                          words=struct.unpack_from('<'+'H'*n,b,addr+16)
+                          for k,w in enumerate(words[:-2]):
+                              op=w&255
+                              if op in (0x6e,0x6f,0x70,0x71,0x72,0x74,0x75,0x76,0x77,0x78) and words[k+1]<mn:
+                                  c,t=methods[words[k+1]]
+                                  if api.search(t) or re.search(r'java/lang/(String|CharSequence)|java/util/concurrent|android/os/Handler|xserver|winemu|winlator',c,re.I):
+                                      print('CANDIDATE_INVOKE',k,c,t)
+              for s in strings:
+                  if len(s)<180 and re.search(r'clipboard|commitText|sendUnicode|sendText|inputText|unicode.*key|key.*unicode|XServer',s,re.I):
+                      print('STRING',s)
+          PY
+      - name: Save report only
+        uses: actions/upload-artifact@v4
+        with:
+          name: gamehub-pcengine-109-input-audit
+          path: input-audit.txt
+          retention-days: 7
