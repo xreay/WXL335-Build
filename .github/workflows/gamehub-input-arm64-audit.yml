@@ -1,0 +1,82 @@
+name: GameHub ARM64 text-event audit
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/gamehub-input-arm64-audit.yml'
+permissions:
+  contents: read
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - name: Fetch exact reference
+        run: |
+          curl -fL --retry 2 -o pcengine.apk https://github.com/TideGear/GameScrub/releases/download/pcengine-plugin-109/pcengine-plugin-109.apk
+          echo '725493a0f7f2cacc8acbb6d9d0b37378aa5aa5ad5c84c5537df236fc2a38514d  pcengine.apk' | sha256sum -c -
+          unzip -p pcengine.apk lib/arm64-v8a/libxserver.so > libxserver.so
+          readelf -h libxserver.so
+      - name: Inspect JNI function and first-level call targets
+        run: |
+          python -m pip install --disable-pip-version-check capstone==5.0.6
+          python - <<'PY' | tee arm64-input-audit.txt
+          import struct,collections
+          from capstone import Cs,CS_ARCH_ARM64,CS_MODE_LITTLE_ENDIAN
+          from pathlib import Path
+          b=Path('libxserver.so').read_bytes()
+          assert b[:4]==b'\x7fELF' and b[4]==2 and b[5]==1 and struct.unpack_from('<H',b,18)[0]==183
+          phoff=struct.unpack_from('<Q',b,32)[0]
+          ents,num=struct.unpack_from('<HH',b,54)
+          seg=[]
+          for i in range(num):
+              typ,flags,off,va,pa,fs,ms,al=struct.unpack_from('<II6Q',b,phoff+i*ents)
+              if typ==1:seg.append((off,va,fs,flags))
+          def loc(v,n=1,exec_only=False):
+              return next((o+v-a for o,a,s,f in seg if a<=v and v+n<=a+s and (not exec_only or f&1)),None)
+          def string(v):
+              o=loc(v)
+              if o is None:return b''
+              return b[o:o+100].split(b'\0')[0]
+          def table(o,name,signature,target):
+              n,s,f=struct.unpack_from('<QQQ',b,o)
+              assert string(n)==name and string(s)==signature and f==target
+              assert loc(f,4,True) is not None
+              print('VERIFIED_JNI_TABLE',hex(o),name.decode(),signature.decode(),hex(f))
+          table(0x3a97f0,b'sendTextEvent',b'([B)V',0xbea9c)
+          table(0x3a97d8,b'sendKeyEvent',b'(IIZ)Z',0xbe9dc)
+          cs=Cs(CS_ARCH_ARM64,CS_MODE_LITTLE_ENDIAN)
+          cs.detail=False
+          def inspect(a,limit,label,emit=True):
+              o=loc(a,limit,True)
+              if o is None:return []
+              ins=list(cs.disasm(b[o:o+limit],a))
+              targets=[]
+              counts=collections.Counter()
+              for i in ins:
+                  counts[i.mnemonic]+=1
+                  if i.mnemonic=='bl' and i.op_str.startswith('#'):
+                      try:targets.append(int(i.op_str[1:],0))
+                      except ValueError:pass
+                  if emit:print(f'{i.address:08x} {i.mnemonic:8s} {i.op_str}')
+              print('SUMMARY',label,hex(a),'instructions',len(ins),'direct_calls',','.join(hex(t) for t in dict.fromkeys(targets)),'indirect_calls',counts['blr'],'returns',counts['ret'])
+              return targets
+          # Start/end of text wrapper are bounded by neighboring verified JNI entry points.
+          print('SECTION sendKeyEvent')
+          inspect(0xbe9dc,0xc0,'sendKeyEvent')
+          print('SECTION sendTextEvent')
+          targets=inspect(0xbea9c,0x180,'sendTextEvent_window')
+          # The next window is limited; do not treat instructions after a return as proven reachable.
+          for t in dict.fromkeys(targets):
+              if loc(t,0x100,True) is not None:
+                  print('CALLEE_WINDOW',hex(t))
+                  inspect(t,0x100,'callee_window')
+          print('LIMITATION: bounded disassembly windows and JNI table validation, not runtime causality or repair.')
+          PY
+      - name: Upload analysis only
+        uses: actions/upload-artifact@v4
+        with:
+          name: gamehub-arm64-text-event-audit
+          path: arm64-input-audit.txt
+          retention-days: 7
