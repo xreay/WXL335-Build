@@ -1,0 +1,108 @@
+name: GameHub input native audit
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/gamehub-input-native-audit.yml'
+permissions:
+  contents: read
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Verify pinned binaries
+        run: |
+          curl -fL --retry 2 -o pcengine.apk https://github.com/TideGear/GameScrub/releases/download/pcengine-plugin-109/pcengine-plugin-109.apk
+          echo '725493a0f7f2cacc8acbb6d9d0b37378aa5aa5ad5c84c5537df236fc2a38514d  pcengine.apk' | sha256sum -c -
+          curl -fL --retry 2 -o jadx.zip https://github.com/skylot/jadx/releases/download/v1.5.3/jadx-1.5.3.zip
+          echo '8280f3799c0273fe797a2bcd90258c943e451fd195f13d05400de5e6451d15ec  jadx.zip' | sha256sum -c -
+          unzip -q jadx.zip -d jadx
+      - name: Analyze Java text boundaries
+        run: |
+          mkdir -p analysis
+          jadx/bin/jadx --no-res --show-bad-code --single-class xjp.esb --single-class-output analysis/esb.java pcengine.apk
+          python - <<'PY' | tee java-boundaries.txt
+          from pathlib import Path
+          import re
+          s=Path('analysis/esb.java').read_text()
+          # Report control-flow and API features, not reconstructed source.
+          lines=s.splitlines()
+          starts=[i for i,l in enumerate(lines) if re.match(r'    (?:public|private|protected|static|final)\b.*\([^;]*\).*\{\s*$',l)]
+          for i in starts:
+              end=next((j for j in range(i+1,len(lines)) if lines[j]=='    }'),len(lines))
+              body='\n'.join(lines[i:end+1])
+              if not re.search(r'commitText|setComposingText|sendTextEvent|finishComposingText|sendKeyEvent|Clipboard',body,re.I):continue
+              print('METHOD',i+1,lines[i].strip())
+              for name,regex in [
+                ('UTF8',r'UTF_8|UTF-8|Charsets|StandardCharsets|getBytes'),
+                ('CHAR_SPLIT',r'charAt|codePointAt|toCharArray|substring|subSequence'),
+                ('LOOP',r'\b(?:for|while)\s*\('),
+                ('WAIT',r'\bsleep\b|\bwait\b|delay'),
+                ('DISPATCH',r'\bsendTextEvent\b|\bsendKeyEvent\b'),
+                ('BACKSPACE',r'\b67\b|KEYCODE_DEL'),
+                ('ASYNC',r'\bpost(?:Delayed)?\b|Executor|Handler|Thread'),
+                ('TEXT_COPY',r'\btoString\b|getBytes|StringBuilder'),
+                ('STATE',r'\bthis\.[\w$]+\s*=')]:
+                  for j in range(i,end+1):
+                      if re.search(regex,lines[j]): print(name,j+1,re.findall(regex,lines[j]))
+              for j in range(i+1,end+1):
+                  calls=re.findall(r'([\w$.]+)\s*\(',lines[j])
+                  if calls:print('CALLS',j+1,','.join(calls))
+          PY
+      - name: Inspect native JNI and input mapping evidence
+        run: |
+          python - <<'PY'
+          import zipfile
+          z=zipfile.ZipFile('pcengine.apk')
+          for name in ['lib/arm64-v8a/libxserver.so','lib/arm64-v8a/libwinemu.so']:
+              z.extract(name,'analysis')
+          PY
+          python - <<'PY' | tee native-boundaries.txt
+          import re,struct,subprocess
+          from pathlib import Path
+          for p in Path('analysis/lib/arm64-v8a').glob('*.so'):
+              b=p.read_bytes()
+              print('LIB',p.name,len(b))
+              pattern=re.compile(r'sendTextEvent|sendKeyEvent|JNI_OnLoad|RegisterNatives|XServer|clipboard|selection|keysym|keymap|keyboardmapping|mappingnotify|unicode|utf8|utf-8|xkb',re.I)
+              for m in re.finditer(rb'[\x20-\x7e]{5,180}\x00',b):
+                  v=m.group()[:-1].decode('ascii')
+                  if pattern.search(v):print('STRING',hex(m.start()),v)
+              # ELF virtual address mapping, including direct-address JNI native table candidates.
+              phoff=struct.unpack_from('<Q',b,32)[0]
+              ents,num=struct.unpack_from('<HH',b,54)
+              seg=[]
+              for i in range(num):
+                  typ,flags,off,va,pa,fs,ms,al=struct.unpack_from('<II6Q',b,phoff+i*ents)
+                  if typ==1:seg.append((off,va,fs,flags))
+              def va(off):
+                  return next((v+off-o for o,v,s,f in seg if o<=off<o+s),None)
+              def loc(v):
+                  return next((o+v-a for o,a,s,f in seg if a<=v<a+s),None)
+              for name in [b'sendTextEvent\x00',b'sendKeyEvent\x00']:
+                  for m in re.finditer(re.escape(name),b):
+                      a=va(m.start())
+                      if a is None:continue
+                      print('JNI_NAME',name,hex(a))
+                      for q in re.finditer(re.escape(struct.pack('<Q',a)),b):
+                          o=q.start()
+                          if o+24>len(b) or o%8:continue
+                          sig,fn=struct.unpack_from('<QQ',b,o+8)
+                          so=loc(sig)
+                          if so is None or loc(fn) is None:continue
+                          ss=b[so:so+100].split(b'\0')[0]
+                          if not ss.startswith(b'('):continue
+                          print('JNI_TABLE_CANDIDATE',hex(o),ss,hex(fn))
+              rel=subprocess.check_output(['readelf','-dW',str(p)],text=True)
+              for line in rel.splitlines():
+                  if re.search(r'ANDROID_REL|RELR|RELA|NEEDED',line):print('DYNAMIC',line.strip())
+          PY
+      - name: Upload report only
+        uses: actions/upload-artifact@v4
+        with:
+          name: gamehub-input-native-boundaries
+          path: |
+            java-boundaries.txt
+            native-boundaries.txt
+          retention-days: 7
