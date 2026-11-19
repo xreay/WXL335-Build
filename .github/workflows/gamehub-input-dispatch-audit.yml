@@ -1,0 +1,117 @@
+name: GameHub text dispatch and key mapping audit
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/gamehub-input-dispatch-audit.yml'
+permissions:
+  contents: read
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - name: Fetch exact reference and inspect call boundaries
+        run: |
+          curl -fL --retry 2 -o pcengine.apk https://github.com/TideGear/GameScrub/releases/download/pcengine-plugin-109/pcengine-plugin-109.apk
+          echo '725493a0f7f2cacc8acbb6d9d0b37378aa5aa5ad5c84c5537df236fc2a38514d  pcengine.apk' | sha256sum -c -
+          unzip -p pcengine.apk lib/arm64-v8a/libxserver.so > libxserver.so
+          python -m pip install --disable-pip-version-check capstone==5.0.6 pyelftools==0.32
+          python - <<'PY' | tee dispatch-audit.txt
+          from pathlib import Path
+          from capstone import Cs,CS_ARCH_ARM64,CS_MODE_LITTLE_ENDIAN
+          from elftools.elf.elffile import ELFFile
+          import struct,collections
+          b=Path('libxserver.so').read_bytes()
+          f=open('libxserver.so','rb'); elf=ELFFile(f)
+          assert elf['e_machine']=='EM_AARCH64'
+          loads=[s for s in elf.iter_segments() if s['p_type']=='PT_LOAD']
+          def offset(a,n=4,execute=False):
+              for s in loads:
+                  v,z,o=s['p_vaddr'],s['p_filesz'],s['p_offset']
+                  if v<=a and a+n<=v+z and (not execute or s['p_flags']&1):return o+a-v
+          def cstr(a):
+              o=offset(a,1)
+              if o is None:return ''
+              q=b[o:o+180].split(b'\0')[0]
+              return q.decode('ascii','ignore') if q and all(32<=x<127 for x in q) else ''
+          cs=Cs(CS_ARCH_ARM64,CS_MODE_LITTLE_ENDIAN)
+          # Resolve PLT GOT relocation names to avoid mistaking import stubs for logic.
+          imports={}
+          for sec in elf.iter_sections():
+              if sec['sh_type'] not in ('SHT_RELA','SHT_REL'):continue
+              syms=elf.get_section(sec['sh_link'])
+              for r in sec.iter_relocations():
+                  idx=r['r_info_sym']
+                  if idx:imports[r['r_offset']]=syms.get_symbol(idx).name
+          plt=elf.get_section_by_name('.plt')
+          stubs={}
+          if plt:
+              for a in range(plt['sh_addr'],plt['sh_addr']+plt['sh_size'],16):
+                  o=offset(a,16,True)
+                  if o is None:continue
+                  ins=list(cs.disasm(b[o:o+16],a))
+                  if len(ins)<3:continue
+                  try:
+                      first=ins[0].op_str.split('#')[1]
+                      second=ins[1].op_str.split('#')[1].split(']')[0]
+                      if ins[0].mnemonic=='adrp' and ins[1].mnemonic=='ldr':
+                          got=int(first,0)+int(second,0)
+                          if got in imports:stubs[a]=imports[got]
+                  except (IndexError,ValueError):pass
+          print('PLT_RESOLVED',len(stubs))
+          def dest(i):
+              try:return int(i.op_str.rsplit('#',1)[1],0)
+              except (ValueError,IndexError):return None
+          def collect(start,maxspan=0x1000,maxins=360):
+              # Walk reachable basic blocks, stop at tail calls and returns.
+              q=[start]; seen={}; calls=set(); refs=set()
+              while q and len(seen)<maxins:
+                  a=q.pop()
+                  while start<=a<start+maxspan and a not in seen and len(seen)<maxins:
+                      o=offset(a,4,True)
+                      if o is None:break
+                      i=next(cs.disasm(b[o:o+4],a),None)
+                      if i is None:break
+                      seen[a]=i
+                      m=i.mnemonic;t=dest(i)
+                      if m=='bl' and t is not None:calls.add(t)
+                      if m=='adr' and t is not None:
+                          st=cstr(t)
+                          if st:refs.add(st)
+                      if m in ('ret','br','eret','brk'):break
+                      if m=='b':
+                          if t is not None and start<=t<start+maxspan:q.append(t)
+                          elif t is not None:calls.add(t)
+                          break
+                      if m.startswith('b.') or m in ('cbz','cbnz','tbz','tbnz'):
+                          if t is not None:q.append(t)
+                      a+=4
+              return seen,calls,refs
+          root=0xbefc8
+          todo=collections.deque([(root,0),(0xbea9c,0)])
+          done=set(); budget=24
+          while todo and len(done)<budget:
+              a,depth=todo.popleft()
+              if a in done or a in stubs or offset(a,4,True) is None:continue
+              done.add(a)
+              seen,calls,refs=collect(a,0x1800 if a==root else 0x900,500 if a==root else 190)
+              print('FUNCTION',hex(a),'DEPTH',depth,'N',len(seen),'CALLS',','.join(f'{t:x}:{stubs.get(t,"local")}' for t in sorted(calls)))
+              for s in sorted(refs):print('REF',s)
+              # Keep callback fully inspectable; descendants bounded.
+              for addr,i in sorted(seen.items()):
+                  t=dest(i)
+                  annotation=(' ; '+stubs[t]) if t in stubs else ''
+                  print(f'{addr:08x} {i.mnemonic:8s} {i.op_str}{annotation}')
+              if depth<2:
+                  for t in sorted(calls):
+                      if t not in stubs and t not in done and offset(t,4,True) is not None:todo.append((t,depth+1))
+          print('LIMIT: static control-flow heuristic; unresolved indirect calls and boundaries require manual verification.')
+          PY
+      - name: Upload report only
+        uses: actions/upload-artifact@v4
+        with:
+          name: gamehub-text-dispatch-audit
+          path: dispatch-audit.txt
+          retention-days: 7
